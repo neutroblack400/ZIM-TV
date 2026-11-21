@@ -1,0 +1,229 @@
+// The ZIMTV IPTV v2 layout (src/ui/layout.h, docs/zimtv-ui-v2-layouts.md): everything inside the TV-safe area, no
+// overlapping blocks, grids and rails that add up to their widths, the row counts the layout promises, and room
+// for the focus scale. These are the geometric facts that can be checked without the PS4 renderer; how the
+// screens look is checked on hardware (docs/checkpoint-zimtv-ui-2.txt).
+
+#include "check.h"
+#include "../../src/ui/layout.h"
+#include "../../src/ui/palette.h"
+
+using namespace layout;
+
+namespace {
+    const float FOCUS_BORDER = 4;   // theme::FOCUS_BORDER (theme.h needs libcross2d)
+    const float LINE_24 = 30;       // line heights (Label: size x 1.25)
+    const float LINE_28 = 35;
+
+    // rows a ListView shows for a height (ui::ListView: (h + gap) / (row + gap))
+    int listRows(float h, float row, float gap) {
+        return (int) ((h + gap) / (row + gap));
+    }
+
+    bool inside(float x, float w) {
+        return x >= SAFE_X && x + w <= SAFE_RIGHT + 0.01f;
+    }
+}
+
+TEST(layout_frame_and_rails) {
+    CHECK_EQ(SAFE_RIGHT, 1824.0f);
+    CHECK_EQ(SAFE_BOTTOM, 1026.0f);
+    CHECK_EQ(HINTS_Y + HINTS_H, SAFE_BOTTOM);
+    CHECK(CONTENT_BOTTOM < HINTS_Y);
+    CHECK(CONTENT_TOP > HEADER_Y + 44 * 1.25f);   // the header line ends before the content
+    CHECK_EQ(MAIN_X, RAIL_X + RAIL_W + RAIL_GAP);
+    CHECK(BOTTOM_FADE_Y < BOTTOM_SOLID_Y);
+    CHECK(BOTTOM_SOLID_Y <= HINTS_Y);            // the hints always sit on the solid band
+}
+
+TEST(layout_home) {
+    using namespace layout::home;
+    // the visible cards fill the content width exactly
+    CHECK_EQ(CARDS_VISIBLE * CARD_W + (CARDS_VISIBLE - 1) * CARD_GAP, CONTENT_W);
+    // v3 media card: a landscape card whose poster area is a whole 2:3 poster taking 30-38 % of the width,
+    // exactly the Poster texture box (170 x 255, ImageLoader::boxes) so it is drawn 1:1, never cropped to 16:9
+    CHECK(CARD_W > CARD_H * 1.6f);
+    CHECK(CARD_H / CARD_ART_W > 1.49f && CARD_H / CARD_ART_W < 1.51f);
+    CHECK(CARD_ART_W / CARD_W >= 0.30f && CARD_ART_W / CARD_W <= 0.38f);
+    CHECK_EQ(CARD_ART_W, 170.0f);
+    CHECK_EQ(CARD_H, 255.0f);
+    // the text column beside it: a two-line title (2 x 35), a label line, a caption line and the progress bar
+    CHECK_EQ(CARD_TEXT_X + CARD_TEXT_W + CARD_PAD, CARD_W);
+    CHECK(CARD_TEXT_W >= 300);
+    CHECK(CARD_PAD - 4 + 2 * LINE_28 + 8 + LINE_24 + 4 + 28 < CARD_H - CARD_PAD - 6 - 8);
+    // larger than the v2 cards (408 x 230 artwork)
+    CHECK(CARD_W * CARD_H > 408.0f * 230.0f);
+    // Home header: logo, tabs and clock start at/after SAFE_Y and fit inside the safe frame
+    CHECK(LOGO_Y >= SAFE_Y && LOGO_Y + LOGO_H <= SAFE_BOTTOM);
+    CHECK(NAV_Y >= SAFE_Y && NAV_Y + NAV_H <= SAFE_BOTTOM);
+    CHECK(TAB_Y >= SAFE_Y && TAB_Y + TAB_H <= SAFE_BOTTOM);
+    CHECK(CLOCK_Y >= SAFE_Y && CLOCK_Y + LINE_24 <= SAFE_BOTTOM);
+    CHECK(NAV_Y + NAV_H < NAV_BAND_H);
+    // navigation: the icons end before the clock column, inside the safe area
+    float iconsRight = CONTENT_W - CLOCK_W;
+    float iconsLeft = iconsRight - 4 * ICON - 3 * ICON_GAP;
+    CHECK(iconsLeft > CONTENT_W / 2);
+    // hero: buttons and progress inside the text column, above the first rail
+    CHECK(RESUME_W + BUTTON_GAP + SECONDARY_W <= TEXT_W);
+    CHECK(3 * SECONDARY_W + 2 * BUTTON_GAP <= TEXT_W);   // start state: three section buttons
+    CHECK(BUTTONS_Y + BUTTON_H + 40 < RAILS_Y);
+    CHECK(BUTTONS_Y - PROGRESS_TO_BUTTONS > NAV_Y + NAV_H);
+    // a two-line hero title still clears the navigation: eyebrow, 2 x 80 title, episode, meta above the bar
+    float stackTop = BUTTONS_Y - PROGRESS_TO_BUTTONS - 22 - LINE_24 - 6 - LINE_28 - 8 - 2 * 80 - 6 - LINE_24;
+    CHECK(stackTop > NAV_Y + NAV_H + 30);
+    // backdrop: the fades fit in the layer and the left fade covers the text column's right part
+    CHECK(BACKDROP_FADE_LEFT + BACKDROP_X <= SCREEN_W);
+    CHECK(BACKDROP_X < TEXT_X + TEXT_W);
+    CHECK(BACKDROP_X + BACKDROP_FADE_LEFT > TEXT_X + TEXT_W);
+    CHECK(BACKDROP_FADE_BOTTOM + BACKDROP_FADE_TOP <= BACKDROP_H);
+    // rest view: the first rail's artwork peeks out above the bottom fade
+    CHECK(RAILS_Y + RAIL_HEADING_H < BOTTOM_FADE_Y - 100);
+    // a focused rail is fully above the hints
+    CHECK(VIEW_BOTTOM <= CONTENT_BOTTOM);
+    CHECK_EQ(RAIL_PITCH, RAIL_HEADING_H + CARD_H + layout::home::RAIL_GAP);
+    // the focus ring (no scaling) stays inside the card gap and under the next rail's heading
+    CHECK(CARD_RING_GAP + FOCUS_BORDER < CARD_GAP / 2);
+    CHECK(CARD_RING_GAP + FOCUS_BORDER < layout::home::RAIL_GAP / 2);
+    // hero poster fallback (v3.1): below the v3 enlargement the TV showed as soft (>= 1.47x), at most the box
+    // height, and even the widest poster plus its colour field stay right of the text column (the title area
+    // stays black); its fades fit inside the poster
+    CHECK(HERO_POSTER_MAX_UPSCALE > 1.0f && HERO_POSTER_MAX_UPSCALE <= 1.25f);
+    CHECK(HERO_POSTER_SCALE * BACKDROP_H <= BACKDROP_H);
+    CHECK(HERO_POSTER_MIN_H >= BACKDROP_H / 2 && HERO_POSTER_MIN_H < HERO_POSTER_SCALE * BACKDROP_H);
+    float widestLeft = SCREEN_W + HERO_POSTER_BLEED - HERO_POSTER_MAX_W;
+    CHECK(widestLeft > HERO_TEXT_RIGHT + 200);
+    CHECK(HERO_TEXT_RIGHT == TEXT_X + TEXT_W && HERO_TEXT_RIGHT > BACKDROP_X);
+    CHECK(widestLeft - HERO_WASH_LENGTH < HERO_TEXT_RIGHT);   // the field's start is clamped to the column
+    CHECK(HERO_POSTER_BLEED < HERO_POSTER_MAX_W * 0.15f);      // cropping at the edge stays a sliver
+    CHECK(HERO_POSTER_LEFT_FADE >= 0.4f && HERO_POSTER_LEFT_FADE <= 0.6f);
+    CHECK(HERO_POSTER_BOTTOM_FADE > 0 && HERO_POSTER_BOTTOM_FADE + HERO_POSTER_LEFT_FADE <= 1.0f);
+}
+
+TEST(layout_catalog) {
+    using namespace layout::catalog;
+    CHECK_EQ(GRID_X + GRID_W, SAFE_RIGHT);
+    CHECK(GRID_X > RAIL_X + RAIL_W);
+    const float usable = GRID_W - SCROLL_GUTTER;
+    const float gap = (usable - COLUMNS * POSTER_W) / (COLUMNS - 1);
+    CHECK(gap >= 28);                                  // more breathing room than v1's ~19 px
+    CHECK(POSTER_H / POSTER_W > 1.49f && POSTER_H / POSTER_W < 1.51f);   // 2:3
+    // the focused poster's scale + outline fits in the gaps and above its title
+    CHECK(POSTER_W * (POSTER_FOCUS_SCALE - 1) / 2 + FOCUS_BORDER < gap / 2);
+    CHECK(POSTER_H * (POSTER_FOCUS_SCALE - 1) / 2 + FOCUS_BORDER <= TITLE_GAP);
+    CHECK(POSTER_H * (POSTER_FOCUS_SCALE - 1) / 2 + FOCUS_BORDER < ROW_GAP);
+    // two whole rows end before the bottom fade; the peek row starts inside the visible area
+    CHECK(GRID_Y + GRID_H <= BOTTOM_FADE_Y);
+    CHECK(GRID_Y + GRID_H + ROW_GAP < BOTTOM_SOLID_Y - 60);
+    // density: fewer, larger posters than v1 (8 x 3 of 140 x 210)
+    const int v1Cells = 8 * 3;
+    CHECK(COLUMNS * ROWS < v1Cells * 0.8f);
+    CHECK(COLUMNS * (ROWS + PEEK_ROWS) <= v1Cells);
+    CHECK(POSTER_W * POSTER_H > 140.0f * 210.0f * 1.3f);
+    CHECK(listRows(RAIL_H, RAIL_ROW_H, RAIL_ROW_GAP) >= 12);
+    CHECK(CONTENT_TOP + RAIL_H <= CONTENT_BOTTOM);
+}
+
+TEST(layout_details) {
+    using namespace layout::detail;
+    // movie: poster and text column side by side, all actions on one line
+    CHECK(M_POSTER_X + M_POSTER_W < M_TEXT_X);
+    CHECK_EQ(M_TEXT_X + M_TEXT_W, SAFE_RIGHT);
+    CHECK(360 + 3 * 270 + 3 * 24 <= M_TEXT_W);
+    CHECK(M_PLOT_W <= M_TEXT_W);
+    CHECK(M_POSTER_Y + M_POSTER_H < CONTENT_BOTTOM);
+    CHECK(M_BUTTONS_MIN_Y + 76 < CONTENT_BOTTOM);
+    CHECK(BACKDROP_X + BACKDROP_FADE_LEFT < SCREEN_W);
+    CHECK(M_BACKDROP_FADE_BOTTOM + BACKDROP_FADE_TOP < SCREEN_H);
+    // series: compact top, actions bottom-aligned with the cover, four episode rows on screen
+    CHECK_EQ(S_TEXT_X + S_TEXT_W, SAFE_RIGHT);
+    CHECK_EQ(S_BUTTONS_Y + S_BUTTON_H, S_COVER_Y + S_COVER_H);
+    CHECK(S_RESUME_W + 24 + S_FAVORITE_W <= S_TEXT_W);
+    CHECK(S_SEASONS_Y >= S_COVER_Y + S_COVER_H + 24);
+    CHECK(S_EPISODES_Y >= S_SEASONS_Y + S_CHIP_H + 16);
+    CHECK_EQ(listRows(S_EPISODES_H, S_ROW_H, S_ROW_GAP), 4);
+    CHECK(S_EPISODES_Y + S_EPISODES_H <= CONTENT_BOTTOM);
+    CHECK(S_THUMB_H < S_ROW_H);
+    CHECK(S_THUMB_W / S_THUMB_H > 1.77f && S_THUMB_W / S_THUMB_H < 1.78f);   // 16:9
+    CHECK(S_BACKDROP_FADE_BOTTOM + BACKDROP_FADE_TOP <= S_BACKDROP_H);
+    // the backdrop has dissolved before the episode list starts
+    CHECK(S_BACKDROP_H <= S_EPISODES_Y + 200);
+    // the information area is smaller than v1's (header to the episode list: 560 px)
+    CHECK(S_EPISODES_Y < 560);
+}
+
+TEST(layout_live) {
+    using namespace layout::live;
+    CHECK_EQ(CH_X, MAIN_X);
+    CHECK(CH_X + CH_W < PANEL_X);
+    CHECK_EQ(PANEL_X + PANEL_W, SAFE_RIGHT);
+    CHECK(inside(PANEL_X, PANEL_W));
+    CHECK_EQ(listRows(LIST_H, CH_ROW_H, CH_ROW_GAP), 10);
+    CHECK(LIST_Y + LIST_H <= CONTENT_BOTTOM);
+    CHECK(LIST_Y + PANEL_H <= CONTENT_BOTTOM);
+    // the card holds logo, two-line name, category, number and favorite above the Watch pill
+    CHECK(PANEL_PAD + PANEL_LOGO_H + 26 + 2 * 43 + 10 + LINE_24 * 3 + 16 < PANEL_H - PANEL_PAD - WATCH_H);
+    CHECK(NAME_X > LOGO_X + LOGO_W);
+    CHECK(LOGO_X > NUM_W);
+}
+
+TEST(layout_search) {
+    using namespace layout::search;
+    CHECK(inside(SAFE_X, CONTENT_W));
+    CHECK(FIELD_Y + FIELD_H < KEYS_Y);
+    CHECK_EQ(KEYS_W, 616.0f);
+    CHECK(KEYS_X + KEYS_W + 40 <= RESULTS_X);
+    CHECK_EQ(RESULTS_X + RESULTS_W, SAFE_RIGHT);
+    CHECK(KEYS_Y + 5 * KEY_H + 4 * KEY_GAP <= CONTENT_BOTTOM);
+    CHECK(CHIPS_Y + CHIP_H < SUMMARY_Y);
+    CHECK(SUMMARY_Y + LINE_24 < LIST_Y);
+    CHECK_EQ(listRows(LIST_H, ROW_H, ROW_GAP), 6);
+    CHECK(LIST_Y + LIST_H <= CONTENT_BOTTOM);
+}
+
+TEST(layout_settings) {
+    using namespace layout::settings;
+    CHECK_EQ(LIST_X, MAIN_X);
+    CHECK(LIST_X + LIST_W < DIVIDER_X);
+    CHECK(DIVIDER_X < PANEL_X);
+    CHECK_EQ(PANEL_X + PANEL_W, SAFE_RIGHT);
+    CHECK(SECTION_Y + 32 * 1.25f < LIST_Y);
+    CHECK_EQ(listRows(LIST_H, ROW_H, 0), 10);
+    CHECK(LIST_Y + LIST_H <= CONTENT_BOTTOM);
+    // the accent presets fill the palette grid exactly (3 x 3)
+    CHECK_EQ(palette::ACCENT_COUNT % PALETTE_COLUMNS, 0);
+    CHECK_EQ(palette::ACCENT_COUNT / PALETTE_COLUMNS, 3);
+    // nine categories fit the rail without scrolling
+    CHECK(listRows(CONTENT_BOTTOM - CONTENT_TOP, CAT_ROW_H, RAIL_ROW_GAP) >= 9);
+}
+
+TEST(layout_downloads_and_player) {
+    using namespace layout::downloads;
+    CHECK(TABS_Y + TAB_H < LIST_Y);
+    CHECK(LIST_Y + LIST_H <= CONTENT_BOTTOM);
+    {
+        using namespace layout::player;
+        // Playback Options rows end at the safe edge (v1: ~1870)
+        CHECK_EQ(OPTIONS_X + OPTIONS_PAD + OPTIONS_LIST_W, SAFE_RIGHT);
+        CHECK_EQ(OPTIONS_X + OPTIONS_W, SCREEN_W);
+        // HUD: title in the top fade, progress / time / hints in the bottom one, in this order
+        CHECK(TITLE_Y >= SAFE_Y);
+        CHECK(SUBTITLE_Y + LINE_28 < TOP_FADE_H);
+        CHECK(BOTTOM_Y < BAR_Y);
+        CHECK(BAR_Y + BAR_H < TIME_Y);
+        CHECK(TIME_Y + LINE_28 < HINTS_Y);
+        // the Next Episode card: bottom right inside the safe area, compact, clear of the progress bar / time /
+        // track chips / hints (it may show with or without the HUD), and above both subtitle positions
+        CHECK_EQ(NEXT_X + NEXT_W, SAFE_RIGHT);
+        CHECK(NEXT_Y >= SAFE_Y && NEXT_Y > SUBTITLE_Y + LINE_28);
+        CHECK(NEXT_Y + NEXT_H <= BAR_Y - 30);
+        CHECK(NEXT_X > SCREEN_W / 2 + 300);              // right of the centred subtitle column's middle
+        CHECK(NEXT_W * NEXT_H < 0.04f * SCREEN_W * SCREEN_H);   // the video stays dominant (< 4 % of the screen)
+        CHECK(NEXT_W <= 520 && NEXT_H <= 160);                  // compact (the v3.2 panel was 440 x 230)
+        // subtitles: raised (mpv sub-pos 88) two lines reach up to ~ y 815, bottom ones ~ y 925
+        CHECK(NEXT_Y + NEXT_H <= 800);
+        // contents: eyebrow 16 + 28, title 46 + 35, actions 90 + 44, the bar 12 above the bottom edge
+        CHECK(16 + 28 <= 46 && 46 + LINE_28 <= 90 && 90 + NEXT_BUTTON_H <= NEXT_H - 12 - NEXT_BAR_H - 4);
+        CHECK(NEXT_BAR_H <= 4 && NEXT_SLIDE <= 32 && NEXT_SLIDE_SECONDS <= 0.3);
+        // hidden while the Options panel is open; geometrically it would sit under it
+        CHECK(NEXT_X >= OPTIONS_X);
+    }
+}

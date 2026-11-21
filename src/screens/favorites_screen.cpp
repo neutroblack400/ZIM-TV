@@ -1,0 +1,398 @@
+// Favorites of all types: Channels | Movies | Series tabs (L1/R1). Movies and Series catalogs are loaded
+// lazily (saved copy first) when the screen opens, so their favorites can be shown with posters.
+// Favorites are per source; playlist (M3U) sources only have the Channels tab.
+
+#include "common.h"
+#include "../core/format.h"
+
+using namespace c2d;
+using namespace iptv;
+
+namespace {
+
+    // tabs like Downloads, posters like the catalogs (8 columns at the full content width, two rows)
+    namespace C = layout::catalog;
+    const float TABS_Y = layout::downloads::TABS_Y;
+    const float TOP = 206;
+    const float CONTENT_H = layout::CONTENT_BOTTOM - TOP;
+    const int GRID_COLUMNS = 8;
+    const char *TAB_KEYS[] = {"favorites.tab_channels", "home.movies", "home.series"};
+
+    class FavoritesScreen : public Screen {
+    public:
+        explicit FavoritesScreen(App &a) : Screen(a), listAdapter(this), gridAdapter(this) {
+            tabs = app.session().profile.isPlaylist() ? 1 : 3;
+            liveGen = app.session().liveGeneration;
+            ui::background(this);
+            screens::header(this, tr("home.favorites"));
+            tabLayer = new RectangleShape(FloatRect(theme::SAFE_X, TABS_Y, 1200, layout::downloads::TAB_H));
+            tabLayer->setFillColor(theme::none());
+            add(tabLayer);
+            channels = new ui::ListView(FloatRect(theme::SAFE_X, TOP, theme::CONTENT_W, CONTENT_H), 80, 2, &listAdapter);
+            add(channels);
+            grid = new ui::GridView(FloatRect(theme::SAFE_X, TOP, theme::CONTENT_W, C::GRID_H), C::POSTER_W, C::CELL_H,
+                                    GRID_COLUMNS, C::ROWS, &gridAdapter);
+            add(grid);
+            empty = new ui::EmptyState(FloatRect(theme::SAFE_X, TOP, theme::CONTENT_W, 480));
+            add(empty);
+            screens::hintBar(this, {{A::Confirm, tr("common.open")}, {A::Tabs, tr("favorites.type")},
+                                    {A::Remove, tr("common.remove")}, {A::Back, tr("common.back")}});
+            app.vod().openMovies(app.session().profile);
+            app.vod().openSeries(app.session().profile);
+            rebuild();
+        }
+
+        const char *name() const override { return "favorites"; }
+
+        void onResume() override {
+            liveGen = app.session().liveGeneration;
+            rebuild();
+        }
+
+        void onInputDeviceChanged() override {
+            if (count() == 0) {
+                rebuild();   // the empty state names a key
+            }
+        }
+
+        void onPause() override {
+            app.images().want(std::vector<ImageRequest>());
+        }
+
+        void tick(double) override {
+            if (app.vod().generation() != vodGen || app.images().generation() != imageGen
+                || app.session().liveGeneration != liveGen) {
+                liveGen = app.session().liveGeneration;
+                imageGen = app.images().generation();
+                rebuild();
+                redraw();
+            }
+        }
+
+        void handleInput(const InputEvent &e) override {
+            switch (e.button) {
+                case PadButton::L1:
+                case PadButton::R1: {
+                    int t = tab + (e.button == PadButton::L1 ? -1 : 1);
+                    if (!e.repeat && t >= 0 && t < tabs) {
+                        tab = t;
+                        rebuild();
+                    }
+                    return;
+                }
+                case PadButton::Up:
+                case PadButton::Down:
+                case PadButton::Left:
+                case PadButton::Right: {
+                    int dx = e.button == PadButton::Left ? -1 : e.button == PadButton::Right ? 1 : 0;
+                    int dy = e.button == PadButton::Up ? -1 : e.button == PadButton::Down ? 1 : 0;
+                    if (tab == 0) {
+                        if (dy != 0) {
+                            channels->moveSelection(dy);
+                        } else if (dx > 0 && !e.repeat && tabs > 1) {
+                            tab = 1;
+                            rebuild();
+                        }
+                    } else if (!grid->navigate(dx, dy) && dx != 0 && !e.repeat) {
+                        int t = tab + dx;
+                        if (t >= 0 && t < tabs) {
+                            tab = t;
+                            rebuild();
+                        }
+                    }
+                    requestImages();
+                    return;
+                }
+                case PadButton::L2:
+                case PadButton::R2: {
+                    int d = e.button == PadButton::L2 ? -1 : 1;
+                    if (tab == 0) {
+                        channels->moveSelection(d * channels->pageSize());
+                    } else {
+                        grid->page(d);
+                    }
+                    requestImages();
+                    return;
+                }
+                case PadButton::Cross:
+                    if (!e.repeat) {
+                        open();
+                    }
+                    return;
+                case PadButton::Square:
+                    if (!e.repeat) {
+                        removeFavorite();
+                    }
+                    return;
+                case PadButton::Circle:
+                    if (!e.repeat) {
+                        app.pop();
+                    }
+                    return;
+                default:
+                    return;
+            }
+        }
+
+        // ------------------------------------------------------------------ channel rows
+        int count() const { return tab == 0 ? (int) liveItems.size() : (int) vodItems.size(); }
+
+        C2DObject *createRow(float w, float h) {
+            ChannelRow r;
+            r.bg = new ui::RowFrame(w, h, 16);
+            r.logo = new ui::LogoView(FloatRect(16, (h - 56) / 2, 96, 56), 22, 4, 1.25f);
+            r.logo->setCornersRadius(theme::RADIUS_SMALL);
+            r.bg->add(r.logo);
+            r.name = ui::label(r.bg, "", theme::BODY, 144, ui::Label::centerOffset(theme::BODY, h));
+            r.name->setMaxWidth(w - 144 - 500);
+            r.meta = ui::label(r.bg, "", theme::LABEL, 0, ui::Label::centerOffset(theme::LABEL, h), ui::Weight::Regular,
+                               theme::textSecondary());
+            r.meta->setAlign(ui::Align::Right, w - 24);
+            r.meta->setMaxWidth(440);
+            rows.push_back(r);
+            return r.bg;
+        }
+
+        void bindRow(C2DObject *obj, int index, bool focused) {
+            const LiveChannel &c = app.session().live.channels()[(size_t) liveItems[(size_t) index]];
+            for (auto &r: rows) {
+                if (r.bg != obj) {
+                    continue;
+                }
+                std::shared_ptr<ImageSet> img = app.images().get(c.icon);
+                r.logo->set(c.name, img ? img->at(0).texture : nullptr, img ? img->at(0).size : Vector2i());
+                r.name->setText(c.name);
+                r.meta->setText(categoryName(c.categoryId));
+                r.bg->setState(focused);
+                r.name->setColor(focused ? theme::textStrong() : theme::textPrimary());
+            }
+        }
+
+        // ------------------------------------------------------------------ poster cells
+        C2DObject *createCell(float w, float h) {
+            Cell c;
+            c.root = new RectangleShape(FloatRect(0, 0, w, h));
+            c.root->setFillColor(theme::none());
+            c.poster = new ui::PosterView(FloatRect(0, 0, w, C::POSTER_H), theme::LABEL);
+            c.poster->setCornersRadius(theme::RADIUS);
+            c.poster->setFocusScale(C::POSTER_FOCUS_SCALE);
+            c.root->add(c.poster);
+            c.title = ui::label(c.root, "", theme::LABEL, 0, C::POSTER_H + C::TITLE_GAP, ui::Weight::Regular,
+                                theme::textMuted());
+            c.title->setAlign(ui::Align::Center, w);
+            c.title->setMaxWidth(w);
+            cells.push_back(c);
+            return c.root;
+        }
+
+        void bindCell(C2DObject *obj, int index, bool focused) {
+            std::string title, image;
+            images::ArtMeta art;
+            itemInfo(index, title, image, &art);
+            for (auto &c: cells) {
+                if (c.root != obj) {
+                    continue;
+                }
+                std::shared_ptr<ImageSet> img = app.images().get(ImageKind::Poster, image, art);
+                c.poster->set(title, img ? img->at(0).texture : nullptr, img ? img->at(0).size : Vector2i());
+                c.poster->setProgress(0);
+                c.poster->setWatched(false);
+                c.poster->setFocused(focused);
+                c.poster->setDimmed(!focused);
+                c.title->setText(title);
+                c.title->setColor(focused ? theme::textStrong() : theme::textMuted());
+                c.title->setWeight(focused ? ui::Weight::SemiBold : ui::Weight::Regular);
+            }
+        }
+
+    private:
+        struct ListAdapter : ui::ListView::Adapter {
+            explicit ListAdapter(FavoritesScreen *s) : screen(s) {}
+
+            int count() override { return (int) screen->liveItems.size(); }
+
+            C2DObject *createRow(float w, float h) override { return screen->createRow(w, h); }
+
+            void bindRow(C2DObject *row, int index, bool, bool focused) override {
+                screen->bindRow(row, index, focused);
+            }
+
+            FavoritesScreen *screen;
+        };
+
+        struct GridAdapter : ui::GridView::Adapter {
+            explicit GridAdapter(FavoritesScreen *s) : screen(s) {}
+
+            int count() override { return (int) screen->vodItems.size(); }
+
+            C2DObject *createCell(float w, float h) override { return screen->createCell(w, h); }
+
+            void bindCell(C2DObject *cell, int index, bool focused) override { screen->bindCell(cell, index, focused); }
+
+            FavoritesScreen *screen;
+        };
+
+        struct ChannelRow {
+            ui::RowFrame *bg;
+            ui::LogoView *logo;
+            ui::Label *name;
+            ui::Label *meta;
+        };
+
+        struct Cell {
+            RectangleShape *root;
+            ui::PosterView *poster;
+            ui::Label *title;
+        };
+
+        std::string categoryName(const std::string &id) const {
+            return app.session().live.categoryName(id);   // Uncategorized in the current UI language
+        }
+
+        void itemInfo(int index, std::string &title, std::string &image, images::ArtMeta *art = nullptr) const {
+            int i = vodItems[(size_t) index];
+            if (tab == 1) {
+                const Movie &m = app.vod().movies().items()[(size_t) i];
+                title = m.title;
+                image = m.icon;
+                if (art) {
+                    art->title = m.title;
+                    art->year = m.year;
+                    art->subject = 1;
+                }
+            } else {
+                const Series &s = app.vod().series().items()[(size_t) i];
+                title = s.title;
+                image = s.cover;
+                if (art) {
+                    art->title = s.title;
+                    art->year = s.year;
+                    art->subject = 2;
+                }
+            }
+        }
+
+        void rebuild() {
+            vodGen = app.vod().generation();
+            liveItems = app.session().live.favorites(app.library().favorites(ContentType::Live));
+            if (tab == 1) {
+                vodItems = app.vod().movies().favorites(app.library().favorites(ContentType::Movie));
+            } else if (tab == 2) {
+                vodItems = app.vod().series().favorites(app.library().favorites(ContentType::Series));
+            } else {
+                vodItems.clear();
+            }
+            size_t counts[3] = {liveItems.size(), app.library().favorites(ContentType::Movie).size(),
+                                app.library().favorites(ContentType::Series).size()};
+            for (auto *c: tabLayer->getChilds()) {
+                tabLayer->remove(c);
+                delete c;
+            }
+            float x = 0;
+            for (int t = 0; t < tabs; t++) {
+                auto *chip = new ui::Chip(tr(TAB_KEYS[t]) + "  " + std::to_string(counts[t]), x, 0, 0,
+                                          layout::downloads::TAB_H);
+                chip->setState(t == tab, false);
+                tabLayer->add(chip);
+                x += chip->width() + 12;
+            }
+            channels->setVisibility(tab == 0 ? Visibility::Visible : Visibility::Hidden);
+            grid->setVisibility(tab != 0 ? Visibility::Visible : Visibility::Hidden);
+            channels->reload();
+            grid->reload();
+            const SectionStatus &st = tab == 1 ? app.vod().movieStatus() : app.vod().seriesStatus();
+            bool loading = tab != 0 && counts[tab] > 0 && vodItems.empty()
+                           && (st.status == CatalogStatus::Loading || st.status == CatalogStatus::NotLoaded);
+            if (loading) {
+                empty->set(tr("common.loading"), "");
+            } else if (count() == 0) {
+                empty->set(tr("empty.favorites_title"),
+                           tr(tab == 0 ? "favorites.empty_channels" : tab == 1 ? "favorites.empty_movies"
+                                                                               : "favorites.empty_series",
+                              {screens::keyName(A::Favorite)}));
+            } else {
+                empty->set("", "");
+            }
+            requestImages();
+        }
+
+        void requestImages() {
+            if (!app.settings().get().loadImages) {
+                return;
+            }
+            std::vector<ImageRequest> req;
+            if (tab == 0) {
+                int first = channels->firstVisible();
+                for (int i = first; i < first + channels->visibleCount() && i < (int) liveItems.size(); i++) {
+                    req.push_back({ImageKind::Logo, app.session().live.channels()[(size_t) liveItems[(size_t) i]].icon});
+                }
+            } else {
+                int first = grid->firstVisible();
+                for (int i = first; i < first + grid->cellCount() && i < (int) vodItems.size(); i++) {
+                    std::string title, image;
+                    images::ArtMeta art;
+                    itemInfo(i, title, image, &art);
+                    req.push_back({ImageKind::Poster, image, art});
+                }
+            }
+            app.images().want(req);
+        }
+
+        void open() {
+            if (tab == 0) {
+                if (!liveItems.empty()) {
+                    app.push(screens::makeLivePlayer(app, liveItems, channels->selected()));
+                }
+            } else if (!vodItems.empty()) {
+                int i = vodItems[(size_t) grid->selected()];
+                if (tab == 1) {
+                    app.push(screens::makeMovieDetail(app, app.vod().movies().items()[(size_t) i]));
+                } else {
+                    app.push(screens::makeSeriesDetail(app, app.vod().series().items()[(size_t) i]));
+                }
+            }
+        }
+
+        void removeFavorite() {
+            if (count() == 0) {
+                return;
+            }
+            if (tab == 0) {
+                app.library().toggleFavorite(ContentType::Live,
+                                             app.session().live.channels()[(size_t) liveItems[(size_t) channels->selected()]].id);
+            } else {
+                int i = vodItems[(size_t) grid->selected()];
+                if (tab == 1) {
+                    app.library().toggleFavorite(ContentType::Movie, app.vod().movies().items()[(size_t) i].streamId);
+                } else {
+                    app.library().toggleFavorite(ContentType::Series, app.vod().series().items()[(size_t) i].seriesId);
+                }
+            }
+            app.saveLibrary();
+            app.toast(tr("favorites.removed"));
+            rebuild();
+        }
+
+        ListAdapter listAdapter;
+        GridAdapter gridAdapter;
+        RectangleShape *tabLayer;
+        ui::ListView *channels;
+        ui::GridView *grid;
+        ui::EmptyState *empty;
+        std::vector<ChannelRow> rows;
+        std::vector<Cell> cells;
+        std::vector<int> liveItems;
+        std::vector<int> vodItems;
+        int tab = 0;
+        int tabs = 3;            // Channels, Movies, Series (playlist sources: Channels only)
+        unsigned liveGen = 0;
+        unsigned vodGen = 0;
+        unsigned imageGen = 0;
+    };
+}
+
+namespace screens {
+    Screen *makeFavorites(App &app) {
+        return new FavoritesScreen(app);
+    }
+}

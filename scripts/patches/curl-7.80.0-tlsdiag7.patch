@@ -1,0 +1,157 @@
+--- a/lib/vtls/mbedtls.c
++++ b/lib/vtls/mbedtls.c
+@@ -51,6 +51,9 @@
+ #include <mbedtls/ctr_drbg.h>
+ #include <mbedtls/sha256.h>
+ 
++#include <stdio.h>
++#include <stdarg.h>
++
+ #if MBEDTLS_VERSION_MAJOR >= 2
+ #  ifdef MBEDTLS_DEBUG
+ #    include <mbedtls/debug.h>
+@@ -264,6 +267,119 @@
+   return result;
+ }
+ 
++
++/* ---- TLS diagnostics instrumentation (TLSDIAG7): logs only, no behavior change.
++   The PS4 has no reliable stdio for libraries: diagnostics go through a hook that
++   the application overrides (it logs via its own working logger). If the app does
++   not define the hook, the default weak stub does nothing. Verification untouched.
++   Dumps: the CA file parse result + cert count at load, the certificate chain the
++   console actually receives (per cert: subject/issuer/sha256/validity) and the
++   exact verify result. Verification semantics are untouched. */
++void __attribute__((weak)) ps4_diag_line(const char *fmt, ...) { (void)fmt; }
++static void
++mbed_diag_write(const char *fmt, ...)
++{
++  va_list ap;
++  char line[1024];
++  va_start(ap, fmt);
++  vsnprintf(line, sizeof(line), fmt, ap);
++  va_end(ap);
++  ps4_diag_line("%s", line);
++}
++
++static void
++mbed_diag_flag_names(uint32_t flags, char *buf, size_t len)
++{
++  static const struct { uint32_t bit; const char *name; } fl[] = {
++    { MBEDTLS_X509_BADCERT_EXPIRED, "EXPIRED" },
++    { MBEDTLS_X509_BADCERT_REVOKED, "REVOKED" },
++    { MBEDTLS_X509_BADCERT_CN_MISMATCH, "CN_MISMATCH" },
++    { MBEDTLS_X509_BADCERT_NOT_TRUSTED, "NOT_TRUSTED" },
++    { MBEDTLS_X509_BADCRL_NOT_TRUSTED, "CRL_NOT_TRUSTED" },
++    { MBEDTLS_X509_BADCRL_EXPIRED, "CRL_EXPIRED" },
++    { MBEDTLS_X509_BADCERT_MISSING, "MISSING" },
++    { MBEDTLS_X509_BADCERT_SKIP_VERIFY, "SKIP_VERIFY" },
++    { MBEDTLS_X509_BADCERT_OTHER, "OTHER" },
++    { MBEDTLS_X509_BADCERT_FUTURE, "FUTURE" },
++    { MBEDTLS_X509_BADCRL_FUTURE, "CRL_FUTURE" },
++    { MBEDTLS_X509_BADCERT_KEY_USAGE, "KEY_USAGE" },
++    { MBEDTLS_X509_BADCERT_EXT_KEY_USAGE, "EXT_KEY_USAGE" },
++    { MBEDTLS_X509_BADCERT_NS_CERT_TYPE, "NS_CERT_TYPE" },
++    { MBEDTLS_X509_BADCERT_BAD_MD, "BAD_MD" },
++    { MBEDTLS_X509_BADCERT_BAD_PK, "BAD_PK" },
++    { MBEDTLS_X509_BADCERT_BAD_KEY, "BAD_KEY" },
++  };
++  size_t i;
++  buf[0] = '\0';
++  for(i = 0; i < sizeof(fl) / sizeof(fl[0]); ++i) {
++    if(flags & fl[i].bit) {
++      if(buf[0])
++        strcat(buf, "|");
++      strcat(buf, fl[i].name);
++    }
++  }
++}
++
++static void
++mbed_diag_log_verify(struct connectdata *conn, int sockindex)
++{
++  struct ssl_connect_data *connssl = &conn->ssl[sockindex];
++  struct ssl_backend_data *backend = connssl->backend;
++  char flagnames[256];
++  uint32_t ret;
++
++  ret = mbedtls_ssl_get_verify_result(&backend->ssl);
++  mbed_diag_flag_names(ret, flagnames, sizeof(flagnames));
++  mbed_diag_write("TLS-DIAG7 host=%s verify_result=0x%08x [%s]",
++                  SSL_HOST_NAME(), (unsigned int) ret,
++                  flagnames[0] ? flagnames : "none");
++}
++
++static void
++mbed_diag_dump_chain(struct connectdata *conn, int sockindex)
++{
++  struct ssl_connect_data *connssl = &conn->ssl[sockindex];
++  struct ssl_backend_data *backend = connssl->backend;
++  const mbedtls_x509_crt *peercert;
++  const mbedtls_x509_crt *crt;
++  static const char hexd[] = "0123456789ABCDEF";
++  char subject[384];
++  char issuer[384];
++  char flagnames[256];
++  char fpbuf[2 * 32 + 1];
++  unsigned char sha[32];
++  uint32_t ret;
++  int depth = 0;
++  size_t i;
++
++  peercert = mbedtls_ssl_get_peer_cert(&backend->ssl);
++  ret = mbedtls_ssl_get_verify_result(&backend->ssl);
++  mbed_diag_flag_names(ret, flagnames, sizeof(flagnames));
++  mbed_diag_write("TLS-DIAG7 host=%s peerchain begin (verify_result=0x%08x [%s])",
++                  SSL_HOST_NAME(), (unsigned int) ret,
++                  flagnames[0] ? flagnames : "none");
++  if(!peercert) {
++    mbed_diag_write("TLS-DIAG7 host=%s peerchain EMPTY", SSL_HOST_NAME());
++    return;
++  }
++  for(crt = peercert; crt; crt = crt->next, ++depth) {
++    mbedtls_x509_dn_gets(subject, sizeof(subject), &crt->subject);
++    mbedtls_x509_dn_gets(issuer, sizeof(issuer), &crt->issuer);
++    mbedtls_sha256_ret(crt->raw.p, crt->raw.len, sha, 0);
++    for(i = 0; i < 32; ++i) {
++      fpbuf[i * 2] = hexd[sha[i] >> 4];
++      fpbuf[i * 2 + 1] = hexd[sha[i] & 0x0F];
++    }
++    fpbuf[64] = '\0';
++    mbed_diag_write("TLS-DIAG7 host=%s depth=%d subject=\"%s\" issuer=\"%s\" sha256=%s valid_from=%04d-%02d-%02d valid_to=%04d-%02d-%02d",
++                    SSL_HOST_NAME(), depth, subject, issuer, fpbuf,
++                    crt->valid_from.year, crt->valid_from.mon, crt->valid_from.day,
++                    crt->valid_to.year, crt->valid_to.mon, crt->valid_to.day);
++  }
++  mbed_diag_write("TLS-DIAG7 host=%s peerchain end (depth=%d)", SSL_HOST_NAME(), depth);
++}
++/* ---- end TLS diagnostics instrumentation ---- */
++
+ static CURLcode
+ mbed_connect_step1(struct Curl_easy *data, struct connectdata *conn,
+                    int sockindex)
+@@ -318,6 +429,15 @@
+ 
+   if(ssl_cafile) {
+     ret = mbedtls_x509_crt_parse_file(&backend->cacert, ssl_cafile);
++    {
++      mbedtls_x509_crt *walk = &backend->cacert;
++      int n = 0;
++      while(walk) {
++        n++;
++        walk = walk->next;
++      }
++      mbed_diag_write("TLS-DIAG7 cafile=%s cacerts_parsed=%d certs=%d", ssl_cafile ? ssl_cafile : "(null)", ret < 0 ? -1 : ret, n);
++    }
+ 
+     if(ret<0) {
+       mbedtls_strerror(ret, errorbuf, sizeof(errorbuf));
+@@ -630,6 +748,8 @@
+     ret &= ~MBEDTLS_X509_BADCERT_CN_MISMATCH;
+ 
+   if(ret && SSL_CONN_CONFIG(verifypeer)) {
++    mbed_diag_dump_chain(conn, sockindex);
++    mbed_diag_log_verify(conn, sockindex);
+     if(ret & MBEDTLS_X509_BADCERT_EXPIRED)
+       failf(data, "Cert verify failed: BADCERT_EXPIRED");
+ 

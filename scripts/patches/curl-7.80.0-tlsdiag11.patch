@@ -1,0 +1,74 @@
+--- a/lib/vtls/mbedtls.c
++++ b/lib/vtls/mbedtls.c
+@@ -333,6 +333,59 @@
+ }
+ /* ---- end TLS diagnostics instrumentation ---- */
+ 
++
++/* ---- TLSDIAG11: observe-only certificate fingerprinting. Logs only: for
++   every certificate the server sends during a full handshake, it prints the
++   chain depth (0 = end-entity/leaf), the per-cert verify flags, the DER
++   length and the SHA-256 of the DER bytes. Verification itself is untouched:
++   the callback never writes *flags and always returns 0, so the handshake
++   outcome, verify_result and curl behavior are exactly as before. No DN or
++   subject is read, nothing is walked, nothing is compared or rejected. */
++static int
++zimtv_tls11_f_vrfy(void *p_vrfy, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
++{
++  unsigned char digest[32];
++  char hex[65];
++  const size_t max_der = 65535; /* a TLS handshake message never exceeds this */
++  size_t len = 0;
++  int i;
++  int sha_rc;
++
++  (void) p_vrfy;
++  if(crt != NULL)
++    len = crt->raw.len;
++
++  if(crt != NULL && crt->raw.p != NULL && len > 0 && len <= max_der) {
++    sha_rc = mbedtls_sha256_ret(crt->raw.p, len, digest, 0); /* 0 = SHA-256 */
++    if(sha_rc == 0) {
++      static const char hexd[] = "0123456789abcdef";
++      for(i = 0; i < 32; ++i) {
++        hex[i * 2]     = hexd[(digest[i] >> 4) & 0x0f];
++        hex[i * 2 + 1] = hexd[digest[i] & 0x0f];
++      }
++      hex[64] = '\0';
++      mbed_diag_write("TLS-DIAG11 depth=%d flags=0x%08lx raw_len=%lu sha256=%s",
++                      depth,
++                      (unsigned long)(flags != NULL ? *flags : 0),
++                      (unsigned long)len,
++                      hex);
++    }
++    else {
++      mbed_diag_write("TLS-DIAG11 depth=%d flags=0x%08lx raw_len=%lu sha256=error",
++                      depth,
++                      (unsigned long)(flags != NULL ? *flags : 0),
++                      (unsigned long)len);
++    }
++  }
++  else {
++    mbed_diag_write("TLS-DIAG11 depth=%d flags=0x%08lx raw=<none>",
++                    depth,
++                    (unsigned long)(flags != NULL ? *flags : 0));
++  }
++  return 0; /* always: the verify flags alone decide the outcome */
++}
++/* ---- end TLSDIAG11 ---- */
++
+ static CURLcode
+ mbed_connect_step1(struct Curl_easy *data, struct connectdata *conn,
+                    int sockindex)
+@@ -599,6 +652,11 @@
+                             &backend->cacert,
+                             &backend->crl);
+ 
++  /* TLSDIAG11: observe-only fingerprint logging; verification is untouched */
++  mbedtls_ssl_conf_verify(&backend->config,
++                          zimtv_tls11_f_vrfy,
++                          NULL);
++
+   if(SSL_SET_OPTION(key) || SSL_SET_OPTION(key_blob)) {
+     mbedtls_ssl_conf_own_cert(&backend->config,
+                               &backend->clicert, &backend->pk);

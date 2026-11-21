@@ -1,0 +1,80 @@
+<#
+.SYNOPSIS
+    Builds and runs the host-side unit tests with MSVC (/W4 /WX):
+      - production app: core (utf8/json/url), iptv (Xtream), storage, keyboard model, redaction,
+        DS4 key repeat / stick filter, scroll math, logo pipeline (stb_image from libcross2d), stability
+        presets and the reconnect state machine, catalog audit / cache round trip, search index, sorting,
+        exact resume, Continue Watching, Series plan, HUD timing, performance at real catalog scale
+      - playback test app: redaction and test_streams.txt parsing, plus config_check.exe
+#>
+$ErrorActionPreference = 'Stop'
+
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$Out = Join-Path $RepoRoot 'build\host-tests'
+New-Item -ItemType Directory -Force $Out | Out-Null
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vs = & $vswhere -latest -products * -property installationPath
+if (-not $vs) { throw 'Visual Studio / Build Tools not found' }
+if (-not (Test-Path "${env:ProgramFiles(x86)}\Windows Kits\10\Include")) {
+    throw 'Windows SDK missing (Visual Studio Installer: add Microsoft.VisualStudio.Component.Windows11SDK.26100)'
+}
+# the x64-hosted toolset may not be installed; vcvarsall x86_amd64 (x86-hosted, x64 target) always is
+$vcvars = "`"$(Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat')`" x86_amd64"
+$env_prefix = "set `"PATH=${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer;%PATH%`" && $vcvars >nul"
+# /O2: the performance tests (search index, sorting, parsing at real catalog scale) measure optimized code
+$cl = 'cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /utf-8 /D_CRT_SECURE_NO_WARNINGS'
+# stb_image.h / stb_image_write.h: the copies libcross2d compiles into the PS4 build
+$cl += " /I`"$RepoRoot\external\pplay-reference\libcross2d\include`""
+
+function Invoke-TestBuild([string] $name, [string[]] $sources) {
+    $obj = Join-Path $Out "obj-$name"
+    New-Item -ItemType Directory -Force $obj | Out-Null
+    $src = ($sources | ForEach-Object { "`"$_`"" }) -join ' '
+    cmd /c "$env_prefix && $cl /Fe`"$Out\$name.exe`" /Fo`"$obj\\`" $src"
+    if ($LASTEXITCODE -ne 0) { throw "$name build failed" }
+}
+
+# production app
+$s = "$RepoRoot\src"
+$h = "$RepoRoot\tests\host"
+Invoke-TestBuild 'app_tests' @(
+    "$h\test_main.cpp", "$h\test_core.cpp", "$h\test_iptv.cpp", "$h\test_storage.cpp", "$h\test_jobs.cpp",
+    "$h\test_live.cpp", "$h\test_text.cpp", "$h\test_input.cpp", "$h\test_images.cpp", "$h\test_playback.cpp", "$h\test_vod.cpp", "$h\test_tracks.cpp",
+    "$h\test_search.cpp", "$h\test_progress.cpp", "$h\test_catalog.cpp", "$h\test_downloads.cpp", "$h\test_i18n.cpp", "$h\test_display.cpp",
+    "$h\test_m3u.cpp", "$h\test_theme.cpp", "$h\test_layout.cpp", "$h\test_image_fit.cpp", "$h\test_clock.cpp", "$h\test_autonext.cpp", "$h\stb_impl.cpp",
+    "$h\test_https.cpp", "$h\test_keyboard.cpp", "$h\test_stalker.cpp", "$h\test_localmedia.cpp", "$h\test_subtitles.cpp", "$h\test_http_policy.cpp",
+    "$h\test_hints.cpp", "$h\test_continue.cpp", "$h\test_hero_art.cpp", "$h\test_ux_pass.cpp", "$h\test_grid_binding.cpp", "$h\test_home_rails.cpp",
+    "$s\core\utf8.cpp", "$s\core\json.cpp", "$s\core\url.cpp", "$s\iptv\xtream.cpp", "$s\iptv\catalog.cpp",
+    "$s\iptv\m3u.cpp",
+    "$s\iptv\search_index.cpp", "$s\app\vod_progress.cpp", "$s\app\series_plan.cpp",
+    "$s\storage\library_store.cpp", "$s\storage\catalog_cache.cpp",
+    "$s\platform\fs.cpp", "$s\platform\redact.cpp", "$s\platform\log.cpp", "$s\network\jobs.cpp",
+    "$s\storage\profile_store.cpp", "$s\storage\settings_store.cpp", "$s\ui\keyboard_model.cpp",
+    "$s\platform\input_logic.cpp", "$s\ui\scroll_math.cpp", "$s\ui\image_fit.cpp", "$s\platform\clock.cpp", "$s\player\stability.cpp",
+    "$s\images\image_key.cpp", "$s\images\disk_cache.cpp", "$s\images\image_decode.cpp",
+    "$s\images\image_scheduler.cpp", "$s\images\image_pipeline.cpp", "$s\core\format.cpp",
+    "$s\player\tracks.cpp", "$s\player\display.cpp", "$s\i18n\i18n.cpp", "$s\i18n\strings_en.cpp",
+    "$s\i18n\strings_tr.cpp", "$s\downloads\download_model.cpp", "$s\downloads\part_file.cpp",
+    "$s\downloads\download_manager.cpp", "$s\app\offline.cpp", "$s\app\auto_next.cpp",
+    "$s\player\protocols.cpp", "$s\platform\keyboard_logic.cpp", "$s\core\hash.cpp", "$s\iptv\stalker.cpp",
+    "$s\media\local_media.cpp", "$s\player\subtitle_font.cpp", "$s\player\mpv_log_filter.cpp", "$s\network\http_policy.cpp",
+    "$s\platform\input_actions.cpp", "$s\images\hero_art.cpp", "$s\ui\choice_model.cpp", "$s\app\home_cards.cpp")
+
+# playback test app
+$t = "$RepoRoot\tests\playback-test"
+Invoke-TestBuild 'host_tests' @("$t\host-tests\host_tests.cpp", "$t\src\redact.cpp", "$t\src\stream_config.cpp")
+Invoke-TestBuild 'config_check' @("$t\host-tests\config_check.cpp", "$t\src\redact.cpp", "$t\src\stream_config.cpp")
+
+$samples = Join-Path $RepoRoot 'build\xtream-samples'   # optional, from scripts/fetch-xtream-samples.py
+if (Test-Path $samples) { $env:ZIMTV_SAMPLES = $samples } else { Remove-Item Env:\ZIMTV_SAMPLES -ErrorAction SilentlyContinue }
+$icons = Join-Path $RepoRoot 'build\icon-samples'      # optional: real provider logos (never committed)
+if (Test-Path $icons) { $env:ZIMTV_ICON_SAMPLES = $icons } else { Remove-Item Env:\ZIMTV_ICON_SAMPLES -ErrorAction SilentlyContinue }
+$env:ZIMTV_SOURCE_DIR = $s   # localization checks scan the sources
+$env:ZIMTV_TEST_TMP = Join-Path $Out 'tmp'
+New-Item -ItemType Directory -Force $env:ZIMTV_TEST_TMP | Out-Null
+& "$Out\app_tests.exe"
+$appFailed = $LASTEXITCODE -ne 0
+& "$Out\host_tests.exe"
+$testFailed = $LASTEXITCODE -ne 0
+if ($appFailed -or $testFailed) { throw 'host tests failed' }

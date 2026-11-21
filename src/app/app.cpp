@@ -1,0 +1,695 @@
+#include <SDL2/SDL.h>
+#include <unordered_set>
+
+#include "app.h"
+#include "build_info.h"
+#include "epg_service.h"
+#include "screens.h"
+#include "../i18n/i18n.h"
+#include "../iptv/xtream.h"
+#include "../network/http.h"
+#include "../platform/clock.h"
+#include "../platform/fs.h"
+#include "../platform/input_actions.h"
+#include "../platform/log.h"
+#include "../player/subtitle_font.h"
+#include "../ui/text.h"
+#include "../ui/theme.h"
+#include "../ui/widgets.h"
+
+using namespace c2d;
+
+namespace {
+    const double KEEPALIVE_REDRAW = 1.0;   // idle screens are redrawn at most once per second
+    const double IDLE_SLEEP_MS = 8;
+    const double CLOCK_CHECK_AT = 10.0;    // seconds after startup: one clock comparison in the log
+
+#ifdef ZIMTV_DRAW_TRACE
+    // ZIMTV_DRAW_TRACE=ON diagnostics: one log line per visible object per frame (order of drawing).
+    void drawTrace(void *object, int type, float l, float t, float w, float h) {
+        const char *names[] = {"Shape", "Texture", "Text", "Other"};
+        LOG_I("trace", "draw %s %p bounds(%.0f,%.0f %.0fx%.0f)",
+              type >= 0 && type < 4 ? names[type] : "?", object, l, t, w, h);
+    }
+#endif
+}
+
+Session::Session() {
+    static unsigned next = 0;
+    serial = ++next;
+}
+
+Screen::Screen(App &a, bool isModal) : RectangleShape(FloatRect(0, 0, theme::SCREEN_W, theme::SCREEN_H)),
+                                       app(a), modal(isModal) {
+    setFillColor(isModal ? theme::scrim() : theme::none());
+}
+
+Screen::~Screen() {
+    *alive = false;
+}
+
+void Screen::redraw() {
+    app.requestRedraw();
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+App::App() : C2DRenderer({theme::SCREEN_W, theme::SCREEN_H}),
+             profileStore(APP_DATA_DIR), settingsStore(APP_DATA_DIR), xtreamService(jobSystem),
+             stalkerService(jobSystem, APP_DATA_DIR), sourceService(xtreamService, stalkerService), m3uService(jobSystem),
+             epgService(jobSystem),
+             vodLibrary(sourceService, APP_DATA_DIR),
+             libraryStore(APP_DATA_DIR), imageLoader(jobSystem, APP_DATA_DIR "cache/images") {
+    LOG_I("app", "renderer: %s", available ? "OK (SDL2 + OpenGL ES 2 / Piglet)" : "FAILED");
+#ifdef ZIMTV_DRAW_TRACE
+    c2d::C2DObject::drawTraceHook = &drawTrace;
+    LOG_I("app", "ZIMTV_DRAW_TRACE enabled: every visible object logs one line per frame");
+#endif
+    romfsPath = getIo()->getRomFsPath();
+    setClearColor(theme::background());
+    getInput()->setRepeatDelay(0);  // repeat/acceleration is handled by InputManager
+
+    clockx::init();
+    LOG_I("clock", "startup: %s", clockx::clockReport().c_str());
+    if (!ui::loadFonts(romfsPath + "assets/fonts/")) {
+        LOG_E("app", "UI fonts missing from the package");
+    }
+    http::globalInit(romfsPath + "assets/cacert.pem", std::string("PS4IPTV/") + APP_VERSION);
+    jobSystem.setWorkerExitHook(http::releaseThreadResources);
+    jobSystem.start(4);   // API + catalog downloads + up to 2 image loads, never all blocked by one kind
+
+    std::string warning;
+    std::string err;
+    if (!fs::ensureDir(APP_DATA_DIR, &err)) {
+        LOG_E("storage", "%s", err.c_str());
+    }
+    profileStore.load(&warning);
+    if (!warning.empty()) {
+        LOG_W("storage", "%s", warning.c_str());
+    }
+    warning.clear();
+    settingsStore.load(&warning);
+    if (!warning.empty()) {
+        LOG_W("storage", "%s", warning.c_str());
+    }
+    // the UI language is Settings > Language (English unless the user chose otherwise), before any screen exists
+    i18n::setLanguage(i18n::fromCode(settingsStore.get().language));
+    LOG_I("app", "UI language: %s", i18n::code(i18n::language()));
+    applyAccent(false);   // before any screen exists: every shape is built with the saved accent
+    // a USB / Bluetooth keyboard next to the controller (optional: without the module, controller only)
+    keyboard.init();
+    applyKeyboardLayout();
+    LOG_I("storage", "%d profile(s), active '%s'", (int) profileStore.profiles().size(),
+          profileStore.activeId().c_str());
+    warning.clear();
+    libraryStore.load(&warning);
+    if (!warning.empty()) {
+        LOG_W("storage", "%s", warning.c_str());
+    }
+    imageLoader.setEnabled(settingsStore.get().loadImages);
+    // the TMDB backfill is opt-in: the API key is read at request time, never logged, and only used when a
+    // provider image failed and the item carries title/year metadata
+    imageLoader.setTmdbApiKeyProvider([this] { return settingsStore.get().tmdbApiKey; });
+    ui::setSmoothScrolling(settingsStore.get().smoothScrolling);
+
+    // offline downloads: libcurl transport (like the API), files under <data>/downloads/
+    downloadTransport.reset(new dl::CurlTransport(http::userAgent(), http::caBundle()));
+    {
+        dl::ManagerConfig dc;
+        dc.root = APP_DATA_DIR "downloads/";
+        dc.transport = downloadTransport.get();
+        dc.clock = [] { return clockx::monotonic(); };
+        dc.wallClock = [] { return clockx::unixNow(); };
+        dc.buildUrl = [](const dl::Credentials &c, dl::Kind kind, const std::string &id, const std::string &ext) {
+            iptv::Profile p;
+            p.id = c.profileId;
+            p.server = c.server;
+            p.username = c.username;
+            p.password = c.password;
+            return kind == dl::Kind::Episode ? xtream::seriesUrl(p, id, ext) : xtream::movieUrl(p, id, ext);
+        };
+#ifdef __PS4__
+        dc.probeLargeFiles = true;
+#endif
+        downloadManager.reset(new dl::DownloadManager(dc));
+        warning.clear();
+        downloadManager->load(settingsStore.get().resumeDownloadsOnStart, &warning);
+        if (!warning.empty()) {
+            LOG_W("downloads", "%s", warning.c_str());
+        }
+        downloadManager->setAutoRetry(settingsStore.get().retryDownloads);
+        syncDownloadProfiles();
+        int64_t free = downloadManager->freeBytes();
+        LOG_I("downloads", "storage %s: %s free", dc.root.c_str(),
+              free >= 0 ? (std::to_string(free / (1024 * 1024)) + " MiB").c_str() : "unknown");
+        downloadManager->startWorker();
+    }
+
+    // the proven pPlay playback backend; created once, like pPlay's Player (needs the GL context)
+    std::string mpvDir = std::string(APP_DATA_DIR) + "mpv";
+    fs::ensureDir(mpvDir);
+    // Text subtitles are drawn by libass, which has no system fonts on the PS4: mpv 0.34.1 passes
+    // <config-dir>/subfont.ttf to libass as the default font (sub/ass_mp.c), like pPlay's data dir does.
+    // The subtitle font (Inter SemiBold + Arabic / Persian / Hebrew, third_party/fonts-subtitles) is copied there:
+    // libass 0.14 without fontconfig cannot fall back to a second font reliably (GitHub issue #1).
+    {
+        subfont::Result sf = subfont::install(romfsPath + "assets/fonts/", mpvDir, APP_VERSION);
+        if (sf.installed) {
+            LOG_I("app", "subtitle font installed: %s", sf.source.c_str());
+        } else if (!sf.ok) {
+            LOG_W("app", "subtitle font not installed: %s", sf.error.c_str());
+        }
+    }
+    if (!player.init(mpvDir, http::caBundle())) {
+        LOG_E("app", "%s", player.initError().c_str());
+    }
+    forceContinuousRedraw = fs::exists(std::string(APP_DATA_DIR) + "force_redraw");
+    if (forceContinuousRedraw) {
+        LOG_W("app", "force_redraw present: drawing every frame");
+    }
+
+    screenLayer = new RectangleShape(FloatRect(0, 0, theme::SCREEN_W, theme::SCREEN_H));
+    screenLayer->setFillColor(theme::none());
+    add(screenLayer);
+
+    toastBox = ui::box(this, FloatRect(0, 0, 900, 76), theme::surfaceElevated(), 38);
+    toastBox->setOrigin(Origin::Bottom);
+    toastBox->setPosition(theme::SCREEN_W / 2, theme::SCREEN_H - 120);
+    toastText = ui::label(toastBox, "", theme::BODY, 0, ui::Label::centerOffset(theme::BODY, 76),
+                          ui::Weight::SemiBold);
+    toastText->setAlign(ui::Align::Center, 900);
+    toastText->setMaxWidth(860);
+    toastBox->setVisibility(Visibility::Hidden);
+
+    // first screen: onboarding, or the active profile. The text rendering test never opens by itself in a
+    // release: only a Debug build configured with ZIMTV_TEXT_TEST_AT_START (CMake refuses it otherwise).
+#if defined(ZIMTV_DEBUG) && defined(ZIMTV_TEXT_TEST_AT_START)
+    push(screens::makeTextTest(*this, true));
+#else
+    push(firstScreen());
+#endif
+    applyNavigation();
+}
+
+Screen *App::firstScreen() {
+    if (profileStore.profiles().empty()) {
+        return screens::makeOnboarding(*this);
+    }
+    return screens::makeUsers(*this);   // the "Who's watching?" picker — the Netflix-style entry point
+}
+
+App::~App() {
+    LOG_I("app", "shutting down");
+    player.stop();
+    player.shutdown();
+    if (downloadManager) {
+        downloadManager->shutdown();     // the active transfer stops where it is (resumed next start)
+        downloadManager->stopWorker();
+    }
+    jobSystem.stop();
+    for (auto *s: graveyard) {
+        delete s;
+    }
+    graveyard.clear();
+    http::globalShutdown();
+}
+
+void App::saveLibrary() {
+    std::string err;
+    if (!libraryStore.save(&err)) {
+        LOG_E("storage", "library save failed: %s", err.c_str());
+        toast(i18n::tr("library.save_failed"), ToastKind::Error);
+    }
+}
+
+void App::saveLibraryInBackground() {
+    auto snap = std::make_shared<LibraryStore::Snapshot>();
+    if (!libraryStore.snapshot(*snap)) {
+        return;   // nothing changed
+    }
+    auto failed = std::make_shared<std::string>();
+    LibraryStore *store = &libraryStore;
+    jobSystem.submit(JobPriority::High, "library-save", [store, snap, failed](const CancelToken &) {   // i18n-exempt
+        std::string err;
+        if (!store->write(*snap, &err)) {
+            *failed = err.empty() ? "write failed" : err;   // i18n-exempt: log detail
+        }
+    }, [this, failed]() {
+        if (!failed->empty()) {
+            LOG_E("storage", "library save failed: %s", failed->c_str());
+            toast(i18n::tr("library.save_failed"), ToastKind::Error);
+        }
+    });
+}
+
+void App::resetSession() {
+    epgToken.cancel();
+    playlistToken.cancel();
+    currentSession = Session();
+}
+
+void App::setPlaylist(std::shared_ptr<iptv::LiveCatalog> catalog, const m3u::Info &info, PlaylistVod vod) {
+    currentSession.pendingLive = std::move(catalog);
+    currentSession.pendingPlaylist = info;
+    currentSession.pendingMovies = std::move(vod.movies);
+    currentSession.pendingSeries = std::move(vod.series);
+    currentSession.pendingSeriesInfo = std::move(vod.seriesInfo);
+    applyPendingPlaylist();
+}
+
+void App::applyPendingPlaylist() {
+    Session &s = currentSession;
+    if (!s.pendingLive || s.livePlayers > 0) {
+        return;
+    }
+    s.live = std::move(*s.pendingLive);
+    s.pendingLive.reset();
+    s.playlist = s.pendingPlaylist;
+    if (s.pendingMovies || s.pendingSeries) {
+        // the VOD catalogs travel with the same playlist: apply them together so Filmes / Séries show content
+        vodLibrary.setPlaylistCatalogs(std::move(s.pendingMovies), std::move(s.pendingSeries),
+                                       std::move(s.pendingSeriesInfo));
+        LOG_I("vod", "playlist-derived catalogs: %zu movies, %zu series", vodLibrary.movies().size(),
+              vodLibrary.series().size());
+    }
+    s.pendingMovies.reset();
+    s.pendingSeries.reset();
+    s.pendingSeriesInfo.reset();
+    s.categories[0] = s.live.categories();
+    s.categoriesLoaded[0] = true;
+    s.liveLoaded = true;
+    s.liveGeneration++;
+    refreshEpgAuto();   // background job: the guide for the channels now on screen
+    requestRedraw();
+}
+
+void App::refreshEpgAuto() {
+    Session &s = currentSession;
+    if (!s.connected || !s.liveLoaded) {
+        return;
+    }
+    std::string url;
+    if (s.profile.isPlaylist()) {
+        url = s.profile.epgUrl.empty() ? s.playlist.urlTvg : s.profile.epgUrl;   // manual association wins
+    } else if (s.profile.type == iptv::SourceType::Stalker) {
+        return;   // stalker portals expose no XMLTV endpoint we can rely on
+    } else {
+        url = xtream::xmltvUrl(s.profile);
+    }
+    if (url.empty()) {
+        LOG_I("epg", "no guide source for this profile (M3U without url-tvg)");
+        return;
+    }
+    std::unordered_set<std::string> wanted;
+    wanted.reserve(s.live.channels().size());
+    for (const auto &ch : s.live.channels()) {
+        if (!ch.epgId.empty()) {
+            wanted.emplace(ch.epgId);
+        }
+    }
+    if (wanted.empty()) {
+        LOG_I("epg", "no channel carries an EPG id; guide not downloaded");
+        return;
+    }
+    if (!s.epgRefreshGate.request()) {
+        return;
+    }
+    unsigned serial = s.serial;
+    LOG_I("epg", "refreshing the guide (%zu channel id(s))", wanted.size());
+    epgToken = epgService.refresh(s.profile.id, url, wanted, APP_DATA_DIR,
+                                  [this, serial](EpgService::Outcome &o) {
+        Session &cur = currentSession;
+        if (cur.serial != serial) {
+            return;   // another source signed in meanwhile
+        }
+        bool refreshAgain = cur.epgRefreshGate.finish();
+        if (o.ok && o.guide) {
+            size_t channels = o.guide->byChannel.size();
+            int64_t programmes = o.guide->programmes;
+            cur.epg = std::move(o.guide);
+            cur.epgGeneration++;
+            LOG_I("epg", "guide ready: %lld programmes across %zu channel(s)%s", (long long) programmes, channels,
+                  o.staleCache ? " (saved; network unavailable)" : o.fromCache ? " (saved copy)" : "");
+        } else {
+            LOG_W("epg", "guide unavailable: %s", o.message.c_str());
+        }
+        if (refreshAgain) {
+            refreshEpgAuto();
+        }
+    });
+}
+
+void App::notePlaylistLoaded(const std::string &profileId, int channels) {
+    const iptv::Profile *p = profileStore.find(profileId);
+    if (p == nullptr) {
+        return;
+    }
+    iptv::Profile copy = *p;
+    copy.playlistChannels = channels;
+    profileStore.upsert(copy, clockx::unixNow());
+    profileStore.setLastStatus(profileId, i18n::count("m3u.status_channels", channels), clockx::unixNow());
+    std::string err;
+    if (!profileStore.save(&err)) {
+        LOG_E("profiles", "save failed: %s", err.c_str());
+    }
+}
+
+void App::refreshPlaylist(bool manual) {
+    Session &s = currentSession;
+    if (!s.profile.isPlaylist() || !s.connected) {
+        return;
+    }
+    if (s.playlistRefreshing) {
+        if (manual) {
+            toast(i18n::tr("m3u.refresh_running"));
+        }
+        return;
+    }
+    s.playlistRefreshing = true;
+    s.liveGeneration++;   // screens show that a refresh is running
+    unsigned serial = s.serial;
+    std::string profileId = s.profile.id;
+    LOG_I("m3u", "refreshing the playlist (%s)", manual ? "requested" : "saved copy is old");
+    playlistToken = m3uService.load(s.profile, APP_DATA_DIR, M3uService::Source::Network, true,
+                                    [this, serial, profileId, manual](M3uService::Outcome &o) {
+        Session &cur = currentSession;
+        if (cur.serial != serial) {
+            return;   // signed in to another source meanwhile
+        }
+        cur.playlistRefreshing = false;
+        if (o.ok) {
+            int n = o.info.stats.channels;
+            cur.liveNotice.clear();
+            setPlaylist(o.catalog, o.info, {o.movies, o.series, o.seriesInfo});
+            notePlaylistLoaded(profileId, n);
+            if (manual) {
+                toast(i18n::count("m3u.refreshed", n), ToastKind::Success);
+            }
+        } else {
+            // the current list stays
+            cur.liveNotice = i18n::tr("m3u.refresh_failed_notice", {o.message});
+            cur.liveGeneration++;
+            if (manual) {
+                toast(i18n::tr("m3u.refresh_failed", {o.message}), ToastKind::Error);
+            }
+        }
+        requestRedraw();
+    });
+}
+
+void App::syncDownloadProfiles() {
+    std::vector<dl::Credentials> creds;
+    for (const auto &p: profileStore.profiles()) {
+        if (!p.supportsDownloads()) {
+            continue;   // downloads come from Xtream sources only (playlists have no movies, portals single-use links)
+        }
+        dl::Credentials c;
+        c.profileId = p.id;
+        c.name = p.name;
+        c.server = p.server;
+        c.username = p.username;
+        c.password = p.password;
+        creds.push_back(c);
+    }
+    downloadManager->setProfiles(creds);
+}
+
+void App::setPlaybackActive(bool active) {
+    downloadManager->setPlaybackActive(active);
+}
+
+void App::applyKeyboardLayout() {
+    keyboard.setLayout(kbd::layoutFor(settingsStore.get().keyboardLayout, settingsStore.get().language));
+}
+
+void App::applyLanguage(bool rebuildScreens) {
+    i18n::setLanguage(i18n::fromCode(settingsStore.get().language));
+    applyKeyboardLayout();   // "auto" follows the language
+    LOG_I("app", "UI language changed to %s", i18n::code(i18n::language()));
+    if (rebuildScreens) {
+        // every screen builds its labels when it is created: start over at the root, back in Settings
+        replaceAll(currentSession.connected || currentSession.offline ? screens::makeHome(*this) : firstScreen());
+        push(screens::makeSettings(*this));
+    }
+}
+
+void App::applyAccent(bool rebuildScreens) {
+    theme::setAccent(palette::accentIndex(settingsStore.get().accentColor.c_str()));
+    LOG_I("app", "accent color: %s", theme::accentPreset().key);
+    if (rebuildScreens) {
+        replaceAll(currentSession.connected || currentSession.offline ? screens::makeHome(*this) : firstScreen());
+        push(screens::makeSettings(*this, screens::SettingsPage::Appearance));
+    }
+}
+
+double App::now() const {
+    return clockx::monotonic();
+}
+
+void App::requestRedrawAt(double when) {
+    if (redrawAt <= 0 || when < redrawAt) {
+        redrawAt = when;
+    }
+}
+
+void App::toast(const std::string &message, ToastKind kind) {
+    toastText->setText(message);
+    toastBox->setFillColor(kind == ToastKind::Error ? theme::dangerSurface() : kind == ToastKind::Success
+                                                                         ? theme::successSurface()
+                                                                         : theme::surfaceElevated());
+    toastBox->setVisibility(Visibility::Visible);
+    toastUntil = now() + 3.5;
+    requestRedraw();
+}
+
+void App::push(Screen *screen) {
+    pendingOps.emplace_back(0, screen);
+    requestRedraw();
+}
+
+void App::pop() {
+    pendingOps.emplace_back(1, nullptr);
+    requestRedraw();
+}
+
+void App::replaceAll(Screen *screen) {
+    pendingOps.emplace_back(2, screen);
+    requestRedraw();
+}
+
+void App::applyNavigation() {
+    std::vector<std::pair<int, Screen *>> ops;
+    ops.swap(pendingOps);
+    for (auto &op: ops) {
+        // safety net: one broken screen must never kill the whole app (CE-34878-0). The failure is logged
+        // (exception type + message) and the screen is discarded; the stack keeps the last good state.
+        try {
+            if (op.first == 0) {
+                if (top()) {
+                    top()->onPause();
+                }
+                screenLayer->add(op.second);
+                stack.push_back(op.second);
+                LOG_I("nav", "push %s", op.second->name());
+                op.second->onEnter();
+            } else if (op.first == 1) {
+                if (stack.empty()) {
+                    continue;
+                }
+                Screen *s = stack.back();
+                stack.pop_back();
+                screenLayer->remove(s);
+                graveyard.push_back(s);
+                LOG_I("nav", "pop %s", s->name());
+                if (top()) {
+                    top()->onResume();
+                }
+            } else {
+                for (auto *s: stack) {
+                    screenLayer->remove(s);
+                    graveyard.push_back(s);
+                }
+                stack.clear();
+                screenLayer->add(op.second);
+                stack.push_back(op.second);
+                LOG_I("nav", "replace all with %s", op.second->name());
+                op.second->onEnter();
+            }
+        } catch (const std::exception &e) {
+            LOG_E("app", "navigation op %d failed: %s", op.first, e.what());
+            if (op.second != nullptr) {
+                graveyard.push_back(op.second);
+            }
+            toast(i18n::tr("common.failed"), ToastKind::Error);
+        } catch (...) {
+            LOG_E("app", "navigation op %d failed: unknown exception", op.first);
+            if (op.second != nullptr) {
+                graveyard.push_back(op.second);
+            }
+            toast(i18n::tr("common.failed"), ToastKind::Error);
+        }
+    }
+    if (!ops.empty()) {
+        updateVisibility();
+    }
+}
+
+void App::updateVisibility() {
+    bool visible = true;
+    for (int i = (int) stack.size() - 1; i >= 0; i--) {
+        stack[(size_t) i]->setVisibility(visible ? Visibility::Visible : Visibility::Hidden);
+        if (visible && !stack[(size_t) i]->isModal()) {
+            visible = false;  // screens below an opaque screen are not drawn
+        }
+    }
+}
+
+void App::onUpdate() {
+    C2DRenderer::onUpdate();  // libcross2d input polling + children updates (text geometry)
+    if (!inDrawPass) {
+        logic();
+    }
+}
+
+void App::logic() {
+    double t = now();
+
+    // screens popped during the previous frame are deleted here, outside any of their callbacks
+    for (auto *s: graveyard) {
+        delete s;
+    }
+    graveyard.clear();
+
+    if (getInput()->getKeys(0) & EV_QUIT) {
+        LOG_I("app", "quit event");
+        running = false;
+        return;
+    }
+
+    // libcross2d opens pads only at startup: pick up a controller connected later
+    void *joystick = getInput()->getPlayer(0)->data;
+    if (joystick == nullptr) {
+        if (ownPad == nullptr && t >= nextPadProbe) {
+            nextPadProbe = t + 2.0;
+            SDL_JoystickUpdate();
+            if (SDL_NumJoysticks() > 0) {
+                ownPad = SDL_JoystickOpen(0);
+                LOG_I("input", "controller connected after startup: %s", ownPad ? "opened" : SDL_GetError());
+            }
+        }
+        joystick = ownPad;
+    }
+    if (!clockChecked && t >= CLOCK_CHECK_AT) {
+        // on the console the UI clock must follow the process time (wall clock), not the CPU clock
+        clockChecked = true;
+        LOG_I("clock", "after %.0f s: %s", CLOCK_CHECK_AT, clockx::clockReport().c_str());
+    }
+    input.update(joystick, t);
+    actions::DeviceTracker &device = actions::tracker();
+    const unsigned deviceGen = device.generation();
+    for (const auto &e: input.events()) {
+        device.controllerInput();   // a real press / repeat: the hints follow the controller
+        if (top()) {
+            top()->handleInput(e);
+        }
+        requestRedraw();
+    }
+    // the physical keyboard after the controller; both always work. A key that opens / closes a screen (typing on
+    // a source field opens its keyboard) holds the keys after it until that screen is on top: they belong to it.
+    for (const auto &k: keyboard.poll(t)) {
+        device.keyboardInput();     // a real key: the hints follow the keyboard
+        if (heldKeys.size() < 64) {   // bounded: a screen that never settles cannot make it grow
+            heldKeys.push_back(k);
+        }
+    }
+    device.keyboardConnected(keyboard.connected());   // unplugged: back to the controller's hints
+    if (device.generation() != deviceGen) {
+        LOG_I("input", "hints follow the %s", device.active() == actions::Device::Keyboard ? "keyboard" : "controller");
+        ui::HintBar::refreshAll();
+        for (auto *s: stack) {
+            s->onInputDeviceChanged();
+        }
+        requestRedraw();
+    }
+    size_t used = 0;
+    while (used < heldKeys.size() && pendingOps.empty()) {
+        onKey(heldKeys[used++]);
+        requestRedraw();
+    }
+    heldKeys.erase(heldKeys.begin(), heldKeys.begin() + (long) used);
+
+    if (jobSystem.pump() > 0) {
+        requestRedraw();
+    }
+    applyPendingPlaylist();   // a refreshed playlist waiting for the live player to close
+    if (imageLoader.update(t)) {
+        requestRedraw();  // logos became available (at most two new textures per frame)
+    }
+    player.update(t);  // mpv events are drained every frame, whichever screen is on top
+    if (top()) {
+        top()->tick(t);
+        // screens visible under modal screens that need their frame logic (the player under the choice picker)
+        for (int i = (int) stack.size() - 2; i >= 0 && stack[(size_t) i + 1]->isModal(); i--) {
+            if (stack[(size_t) i]->ticksUnderModal()) {
+                stack[(size_t) i]->tick(t);
+            }
+        }
+    }
+    if (toastBox->isVisible() && t > toastUntil) {
+        toastBox->setVisibility(Visibility::Hidden);
+        requestRedraw();
+    }
+    applyNavigation();
+}
+
+void App::onKey(const kbd::Event &k) {
+    Screen *s = top();
+    if (s == nullptr || s->handleKey(k)) {
+        return;
+    }
+    // not taken by the screen: the controller button that means the same - a universal key (navigation everywhere)
+    // or a shortcut of an action this screen offers (its hint bars), never a hidden one (platform/input_actions.h)
+    InputEvent e;
+    if (actions::route(k, ui::HintBar::declared(s), e)) {
+        s->handleInput(e);
+    }
+}
+
+void App::run() {
+    LOG_I("app", "main loop running");
+    while (running) {
+        c2d::Renderer::flip(false, true);  // input + logic only, no GPU work
+        if (!running) {
+            break;
+        }
+        double t = now();
+        bool timed = redrawAt > 0 && t >= redrawAt;
+        bool animating = ui::scrolling(t);
+        for (int i = (int) stack.size() - 1; i >= 0 && !animating; i--) {
+            animating = stack[(size_t) i]->animating();   // the top screen and those visible under modal ones
+            if (!stack[(size_t) i]->isModal()) {
+                break;
+            }
+        }
+        if (dirty || timed || animating || forceContinuousRedraw || t - lastDraw > KEEPALIVE_REDRAW) {
+            dirty = false;
+            if (timed) {
+                redrawAt = 0;
+            }
+            inDrawPass = true;
+            LOG_I("app", "draw begin");
+            C2DRenderer::flip(true, false);  // draw + swap
+            LOG_I("app", "draw end");
+            inDrawPass = false;
+            lastDraw = t;
+        } else {
+            SDL_Delay((Uint32) IDLE_SLEEP_MS);
+        }
+    }
+    LOG_I("app", "main loop ended");
+    // a movie / episode still open keeps its exact position (written synchronously)
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it) {
+        (*it)->onAppExit();
+    }
+    saveLibrary();
+}

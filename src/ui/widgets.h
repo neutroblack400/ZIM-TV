@@ -1,0 +1,417 @@
+// Reusable TV widgets built on libcross2d shapes and ui::Label.
+
+#ifndef ZIMTV_UI_WIDGETS_H
+#define ZIMTV_UI_WIDGETS_H
+
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "cross2d/c2d.h"
+#include "scroll_math.h"
+#include "../platform/input_actions.h"
+#include "text.h"
+#include "theme.h"
+
+namespace ui {
+
+    // Smooth scrolling of every ListView / GridView (Settings > Smooth scrolling). Off: lists move row by row.
+    void setSmoothScrolling(bool on);
+
+    bool smoothScrolling();
+
+    // a list or grid is still gliding: the app keeps drawing frames until it settles
+    bool scrolling(double now);
+
+    // rounded box added to parent
+    c2d::RectangleShape *box(c2d::C2DObject *parent, const c2d::FloatRect &rect, const c2d::Color &color,
+                             float radius = theme::RADIUS);
+
+    Label *label(c2d::C2DObject *parent, const std::string &text, unsigned size, float x, float y,
+                 Weight weight = Weight::Regular, c2d::Color color = theme::textPrimary());
+
+    // full-screen vertical gradient background
+    c2d::C2DObject *background(c2d::C2DObject *parent);
+
+    enum class Glyph {
+        Cross,
+        Circle,
+        Square,
+        Triangle,
+        L1,
+        R1,
+        L2,
+        R2,
+        Options,
+        DPad
+    };
+
+    // a DualShock button symbol (vector shapes; the UI font has no PlayStation glyphs)
+    class ButtonGlyph : public c2d::RectangleShape {
+    public:
+        ButtonGlyph(Glyph glyph, float size);
+    };
+
+    // a keyboard key cap: [Enter] [Esc] [Tab] [F] - rounded corners (a key), not the controller's round pill
+    class KeyCap : public c2d::RectangleShape {
+    public:
+        KeyCap(const std::string &label, float size);
+    };
+
+    // one control hint: an action (platform/input_actions.h) and what it does on this screen
+    struct Hint {
+        actions::Action action;
+        std::string text;
+
+        bool operator==(const Hint &o) const { return action == o.action && text == o.text; }
+    };
+
+    // the glyph (controller) or key cap(s) (keyboard) of an action for the active device, added to `parent` at x;
+    // returns the width used (0: the action has no key on that device and nothing was drawn)
+    float actionGlyph(c2d::C2DObject *parent, actions::Action action, float x, float y, float size,
+                      actions::Device device);
+
+    // Bottom control hints: [glyph] text  [glyph] text ... for the device in use (actions::tracker()): DualShock 4
+    // glyphs, or keyboard key caps after a key was used. An action without a key on the active device is left out.
+    // Pairs ([L1][R1] Category) are one action (actions::Action::Tabs). Keep it to the actions that matter on the
+    // screen (about five).
+    // Every bar belongs to its screen (setOwner; screens::hintBar does it): the keyboard shortcuts of that screen
+    // are exactly the actions its bars show plus setShortcuts() (actions::route), and refreshAll() redraws every bar
+    // when the active device changes.
+    class HintBar : public c2d::RectangleShape {
+    public:
+        HintBar();
+
+        ~HintBar() override;
+
+        void setHints(const std::vector<Hint> &hints);
+
+        // actions whose keyboard shortcuts work on the owner screen without being shown (e.g. the player's Info)
+        void setShortcuts(const std::vector<actions::Action> &shortcuts);
+
+        void setOwner(const c2d::C2DObject *owner) { ownerScreen = owner; }
+
+        // right edge of the last hint (after a setHints / refresh)
+        float contentWidth() const { return width; }
+
+        // the actions declared by every bar of `owner` (shown and shortcuts)
+        static std::vector<actions::Action> declared(const c2d::C2DObject *owner);
+
+        // the active device changed: every bar is drawn again
+        static void refreshAll();
+
+    private:
+        void rebuild();
+
+        std::vector<Hint> current;
+        std::vector<actions::Action> extra;
+        const c2d::C2DObject *ownerScreen = nullptr;
+        actions::Device drawnFor = actions::Device::Controller;
+        float width = 0;
+    };
+
+    // Pill button. Primary (the main action of a screen: Play, Resume, Save...) is accent-filled; secondary is a
+    // quiet elevated pill. Focus = an accent ring drawn a few pixels outside the button (visible on any fill and
+    // with every accent) plus, for secondary buttons, a lighter fill.
+    class Button : public c2d::RectangleShape {
+    public:
+        Button(const std::string &text, const c2d::FloatRect &rect, bool primary = false);
+
+        void setFocused(bool focused);
+
+        void setEnabled(bool enabled);
+
+        bool isEnabled() const { return enabled; }
+
+        void setText(const std::string &text);
+
+        void setPrimary(bool primary);
+
+        // a destructive action (Delete, Cancel download): a dark red pill, never the accent
+        void setDanger(bool danger);
+
+        // a new width (the height stays); the caption is fitted again
+        void setWidth(float width);
+
+    private:
+        void refresh();
+
+        void fit();
+
+        Label *caption;
+        c2d::RectangleShape *ring;
+        bool focused = false;
+        bool enabled = true;
+        bool primary;
+        bool danger = false;
+    };
+
+    // initials tile used where a logo/poster is missing or still loading
+    class Monogram : public c2d::RectangleShape {
+    public:
+        Monogram(float size, unsigned fontSize);
+
+        void setName(const std::string &name);
+
+        static std::string initials(const std::string &name);
+
+        // stable colour for a name's initials tile
+        static c2d::Color color(const std::string &name);
+
+    private:
+        Label *letters;
+        std::string current;
+    };
+
+    // Channel logo in a rounded tile: the image centred with its aspect ratio kept (never stretched), on a
+    // neutral tile so transparent logos stay readable. Without an image it shows the initials placeholder.
+    // The widget holds a reference to the texture it shows, so a texture leaving the image cache is only
+    // released once this widget shows something else.
+    class LogoView : public c2d::RectangleShape {
+    public:
+        // padding: space between the tile edge and the image box; maxUpscale: how far a small image may
+        // be enlarged to fill the box (1 = never)
+        LogoView(const c2d::FloatRect &rect, unsigned initialsSize, float padding, float maxUpscale);
+
+        // texture null: initials placeholder. imageSize: the image part of the (power-of-two) texture.
+        void set(const std::string &name, const std::shared_ptr<c2d::Texture> &texture,
+                 const c2d::Vector2i &imageSize);
+
+    private:
+        c2d::RectangleShape *image;
+        Label *initials;
+        std::shared_ptr<c2d::Texture> shown;
+        std::string currentName;
+        float padding;
+        float maxUpscale;
+        bool showingImage = false;
+    };
+
+    // Thin rounded vertical scrollbar: translucent track, thumb sized visible/total and positioned
+    // first/(total-visible). Hidden when everything fits.
+    class ScrollBar : public c2d::RectangleShape {
+    public:
+        static constexpr float WIDTH = 6;
+        static constexpr float GAP = 16;     // space between list content and the bar
+
+        ScrollBar(float x, float y, float height);
+
+        void setRange(int total, int visible, int first);
+
+        // brighter thumb while the list has focus
+        void setActive(bool active);
+
+    private:
+        c2d::RectangleShape *thumb;
+        bool active = true;
+    };
+
+    // three pulsing dots; call tick() each frame while visible
+    class Spinner : public c2d::RectangleShape {
+    public:
+        explicit Spinner(float size);
+
+        // returns true when the visuals changed (caller requests a redraw)
+        bool tick(double now);
+
+    private:
+        c2d::CircleShape *dots[3];
+        int phase = -1;
+    };
+
+    // Movie poster / series cover in a rounded tile. Images close to the tile's aspect ratio fill it
+    // (cropped evenly, never stretched); others are fitted inside it. Without an image the title is shown.
+    // Optional progress bar (partially watched) and a "watched" badge.
+    class PosterView : public c2d::RectangleShape {
+    public:
+        PosterView(const c2d::FloatRect &rect, unsigned fallbackTextSize);
+
+        void set(const std::string &title, const std::shared_ptr<c2d::Texture> &texture,
+                 const c2d::Vector2i &imageSize);
+
+        // 0 hides the bar
+        void setProgress(float fraction);
+
+        void setWatched(bool watched);
+
+        // a small corner mark: the movie / series has downloaded content (playable offline)
+        void setDownloaded(bool downloaded);
+
+        void setFocused(bool focused);
+
+        // Always fill the tile, whatever the image's shape (cropping the longer side; a portrait poster in a
+        // landscape tile keeps the part `anchorY` (0 top .. 1 bottom) of its height). Default: images far from
+        // the tile's shape are fitted inside it instead.
+        void setCover(bool cover, float anchorY = 0.5f);
+
+        // Focus enlarges the tile around its centre by `scale` (e.g. 1.06) instead of lifting it.
+        void setFocusScale(float scale);
+
+        // artwork drawn slightly darker (not the focused item): texture modulation only
+        void setDimmed(bool dimmed);
+
+    private:
+        void place(const c2d::Vector2i &imageSize);
+
+        c2d::RectangleShape *image;
+        Label *fallback;
+        c2d::RectangleShape *barTrack;
+        c2d::RectangleShape *barFill;
+        c2d::CircleShape *badge;
+        Label *badgeMark;
+        c2d::CircleShape *downloadBadge;
+        std::shared_ptr<c2d::Texture> shown;
+        std::string currentTitle;
+        c2d::Vector2i shownSize;
+        bool showingImage = false;
+        bool lifted = false;
+        bool cover = false;
+        float anchor = 0.5f;
+        float focusScale = 0;
+        bool dimmed = false;
+    };
+
+    // Virtualized grid: only the cells on screen (+ one row) exist and are re-bound when scrolling by whole
+    // rows. Spacing is derived from the rect; a ScrollBar sits in the right gutter. Focus moves at once; the
+    // drawn rows glide after it (scroll::Smooth), clipped to the grid while they do.
+    class GridView : public c2d::RectangleShape {
+    public:
+        struct Adapter {
+            virtual ~Adapter() = default;
+
+            virtual int count() = 0;
+
+            virtual c2d::C2DObject *createCell(float width, float height) = 0;
+
+            virtual void bindCell(c2d::C2DObject *cell, int index, bool focused) = 0;
+        };
+
+        // peekRows: rows drawn below the visible ones (partly off the grid, e.g. fading out under the hints); they
+        // never take the focus, the grid scrolls as if they were not there
+        GridView(const c2d::FloatRect &rect, float cellWidth, float cellHeight, int columns, int rows,
+                 Adapter *adapter, int peekRows = 0);
+
+        void reload();
+
+        void setSelected(int index);
+
+        int selected() const { return sel; }
+
+        // false when the move hits an edge (nothing changed): the screen may move focus elsewhere
+        bool navigate(int dx, int dy);
+
+        bool page(int pages);
+
+        void setFocused(bool focused);
+
+        int columns() const { return cols; }
+
+        int visibleRows() const { return rows; }
+
+        // first item on screen and how many cells are drawn, peek rows included (for image requests)
+        int firstVisible() const { return firstRow * cols; }
+
+        int cellCount() const { return cols * (rows + peek); }
+
+    protected:
+        void onUpdate() override;
+
+        void onDraw(c2d::Transform &transform, bool draw) override;
+
+    private:
+        // animate: glide from the drawn position (moves); otherwise jump there (reloads, new lists)
+        void layout(bool animate);
+
+        void place();
+
+        Adapter *adapter;
+        std::vector<c2d::C2DObject *> cells;
+        ScrollBar *bar;
+        int cols;
+        int rows;
+        int peek = 0;
+        int sel = 0;
+        int firstRow = 0;
+        bool focus = true;
+        float cellWidth = 0;
+        float cellHeight = 0;
+        float gapX = 0;
+        float pitchY = 0;
+        float extent = 0;
+        scroll::Smooth smooth;
+        scroll::SlotBinder binder;   // the item each recycled slot shows (bound when shown for another item)
+        double lastUpdate = -1;
+    };
+
+    // Virtualized vertical list: only the visible rows (+ one) exist; rows are re-bound when scrolling. Focus
+    // moves at once; the drawn rows glide after it (scroll::Smooth), clipped to the list while they do.
+    class ListView : public c2d::RectangleShape {
+    public:
+        struct Adapter {
+            virtual ~Adapter() = default;
+
+            virtual int count() = 0;
+
+            // create one reusable row object of the given size
+            virtual c2d::C2DObject *createRow(float width, float height) = 0;
+
+            // fill a row for item `index`; focused = this row is selected and the list has focus
+            virtual void bindRow(c2d::C2DObject *row, int index, bool selected, bool focused) = 0;
+        };
+
+        ListView(const c2d::FloatRect &rect, float rowHeight, float spacing, Adapter *adapter);
+
+        // call after the data changed; keeps the selection when possible
+        void reload();
+
+        void setSelected(int index);
+
+        int selected() const { return sel; }
+
+        // moves the selection; returns false at the ends (no wrap)
+        bool moveSelection(int delta);
+
+        void setFocused(bool focused);
+
+        bool isFocused() const { return focus; }
+
+        int visibleCount() const { return visibleRows; }
+
+        // index of the first row on screen
+        int firstVisible() const { return first; }
+
+        // rows moved by a page jump (L2/R2): one screen minus one row of context
+        int pageSize() const { return std::max(1, visibleRows - 1); }
+
+        // width available to rows (the scrollbar gutter is reserved on the right)
+        static float rowWidth(float listWidth) { return listWidth - ScrollBar::WIDTH - ScrollBar::GAP; }
+
+    protected:
+        void onUpdate() override;
+
+        void onDraw(c2d::Transform &transform, bool draw) override;
+
+    private:
+        void layout(bool animate);
+
+        void place();
+
+        Adapter *adapter;
+        std::vector<c2d::C2DObject *> rows;
+        ScrollBar *bar = nullptr;
+        int visibleRows = 1;
+        int sel = 0;
+        int first = 0;
+        bool focus = true;
+        float rowH = 0;
+        float pitch = 0;
+        float extent = 0;
+        scroll::Smooth smooth;
+        scroll::SlotBinder binder;   // the item each recycled slot shows (bound when shown for another item)
+        double lastUpdate = -1;
+    };
+}
+
+#endif // ZIMTV_UI_WIDGETS_H

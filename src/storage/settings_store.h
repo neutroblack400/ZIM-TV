@@ -1,0 +1,117 @@
+// Application settings persisted in <dataDir>/settings.json.
+
+#ifndef ZIMTV_STORAGE_SETTINGS_STORE_H
+#define ZIMTV_STORAGE_SETTINGS_STORE_H
+
+#include <map>
+#include <string>
+#include <vector>
+
+#include "../iptv/sorting.h"
+#include "../player/display.h"
+#include "../player/stability.h"
+#include "../player/tracks.h"
+
+// Live stream format (see stability::planFormats)
+enum class StreamFormat {
+    Auto,   // TS first (or what worked last this session), the other format once
+    Ts,     // Prefer TS: TS first, HLS once if TS cannot be opened
+    Hls     // Prefer HLS: HLS first, TS once if HLS cannot be opened
+};
+
+// the choices of Settings > Playback > Show the Next Episode card (seconds before the end), shortest first
+const std::vector<int> &nextCardChoices();
+
+// a stored / chosen value -> one of nextCardChoices() (the nearest; 45 when it is not a number of seconds)
+int clampNextCardSeconds(int seconds);
+
+struct Settings {
+    StreamFormat streamFormat = StreamFormat::Auto;
+    StabilityPreset stability = StabilityPreset::Balanced;
+    bool retryOnStall = true;
+    bool resumeVod = true;
+    // Settings > Playback > Auto-play next episode: the Next Episode card's 7 s countdown (app/auto_next.h).
+    // Stored as "autoPlayNext"; files without it get ON - including v0.2.0 files, whose "autoPlayNextEpisode"
+    // (a different, opt-in feature that defaulted to off) is only written for older builds and never read.
+    bool autoPlayNextEpisode = true;
+    // Settings > Playback > Show the Next Episode card: seconds before the end of an episode (one of
+    // nextCardChoices(), default 45). Stored as "nextEpisodeCardSeconds"; older builds ignore it.
+    int nextCardSeconds = 45;
+    bool loadImages = true;
+    // lists and grids glide to their new position (off: they jump row by row, as before Checkpoint 3.2)
+    bool smoothScrolling = true;
+    // movies / episodes
+    std::string audioLanguage;                    // ISO 639-2 code, "" = Auto (the file's default track)
+    tracks::SubtitleMode subtitleMode = tracks::SubtitleMode::Auto;
+    std::string subtitleLanguage;                 // "" = same as the audio preference
+    int subtitleSize = 1;                         // 0 small, 1 medium, 2 large
+    int subtitlePosition = 0;                     // 0 bottom, 1 raised
+    bool subtitleShadow = false;
+    // video geometry defaults (the Options panel changes only the current playback). Position is never a
+    // default: every playback starts centred.
+    display::Aspect videoAspect = display::Aspect::Source;
+    display::Crop videoCrop = display::Crop::None;
+    int zoomPercent = 100;
+    // offline downloads
+    bool retryDownloads = true;          // network loss: retry automatically with backoff
+    bool resumeDownloadsOnStart = true;  // interrupted downloads continue when the app starts
+    // application UI language: "pt" (default for every installation), "en" or "tr". Never derived from the account,
+    // provider or region. Files written before format version 2 had no language choice: they get Portuguese.
+    std::string language = "pt";
+    // Settings > Appearance > Accent color: a palette::ACCENTS key. Files without it (written before ZIMTV IPTV)
+    // and unknown values get the default reference violet; nothing else in the file changes meaning.
+    std::string accentColor = "purple";
+    // Settings > Language > Keyboard layout of a physical USB / Bluetooth keyboard: "auto" (Turkish Q when the UI
+    // is Turkish, else US), "us" or "tr". Files without it get "auto".
+    std::string keyboardLayout = "auto";
+    // optional TMDB API key for the artwork backfill ("" = disabled, the default). Applied only when the provider's
+    // image is missing/broken and the item is a movie/series with title+year metadata. Never logged, never sent anywhere
+    // except api.themoviedb.org / image.tmdb.org.
+    std::string tmdbApiKey;
+    // Movies / Series grid order, per profile: "<profileId>/movies" -> sort key ("az", "added_desc"...)
+    std::map<std::string, std::string> sortOrders;
+
+    // the geometry every playback starts with (centred)
+    display::Geometry defaultGeometry() const {
+        display::Geometry g;
+        g.aspect = videoAspect;
+        g.crop = videoCrop;
+        g.zoom = display::clampZoom(zoomPercent);
+        return g;
+    }
+};
+
+class SettingsStore {
+
+public:
+
+    explicit SettingsStore(std::string dataDir);
+
+    bool load(std::string *warning = nullptr);
+
+    bool save(std::string *error = nullptr);
+
+    Settings &get() { return settings; }
+
+    const Settings &get() const { return settings; }
+
+    std::string serialize() const;
+
+    bool deserialize(const std::string &text, std::string *error);
+
+    // grid order of Movies (ContentType::Movie) or Series for a profile (Provider order when never chosen)
+    iptv::SortMode sortMode(const std::string &profileId, iptv::ContentType type) const;
+
+    void setSortMode(const std::string &profileId, iptv::ContentType type, iptv::SortMode mode);
+
+    static const char *formatName(StreamFormat f);
+
+    static const char *stabilityKey(StabilityPreset p);
+
+private:
+
+    std::string dir;
+    Settings settings;
+};
+
+#endif // ZIMTV_STORAGE_SETTINGS_STORE_H

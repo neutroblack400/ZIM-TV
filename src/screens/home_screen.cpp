@@ -1,0 +1,1456 @@
+// Início (Home): the reference streaming home - one cinematic hero (Continue Watching) and rails of landscape
+// cards (Continue Watching, Recently Watched, Favorites). Geometry: ui/layout.h (layout::home).
+//
+//   navigation   the ZIM TV logo + [Início  Live TV  Filmes  Séries] and, on the right, icon actions
+//                (search / favorites / downloads / settings) and the clock; L1 / R1 walk through all of them.
+//   hero         the most recent Continue Watching item: eyebrow, title, episode, progress, Resume / Details, all
+//                over the hero art (the provider's landscape backdrop when it loads and is usable, otherwise the
+//                showcase - the poster as a sharp framed object on the right; otherwise the clean dark hero).
+//                Without one: "What would you like to watch?" with the sections as buttons.
+//   rails        Continue Watching, Recently Watched, Favorites (data the app already has, nothing invented);
+//                Continue Watching shows resume positions for movies and episodes (one card per series); Live TV
+//                never appears there. Recently Watched shows at most a few channels while movies / episodes fill
+//                the row. Favorites shows channels (the live list is loaded at sign-in), then movies and series
+//                whose catalog is already in memory (catalogs load lazily when their section opens; Home never
+//                loads them). When none of them can be shown the rail is one quiet line and takes no focus.
+//
+// The page scrolls vertically when a lower rail takes the focus; rails show three cards and move by whole cards.
+// Square / Del on a Continue Watching card hides it from the row only (progress, history, favorite, download
+// stay); on a Recently Watched card it forgets the history entry only. Removing is per press, nothing held.
+
+#include <algorithm>
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "common.h"
+#include "../app/offline.h"
+#include "../app/home_cards.h"
+#include "../app/home_nav.h"
+#include "../core/format.h"
+#include "../images/hero_art.h"
+#include "../platform/clock.h"
+#include "../platform/log.h"
+#include "../ui/focus_colors.h"
+#include "../ui/focus_style.h"
+#include "../ui/scroll_math.h"
+
+using namespace c2d;
+
+namespace {
+
+    namespace L = layout::home;
+
+    const int CW_MAX = 10;
+    const int RECENT_MAX = 10;
+    const int RECENT_LIVE_MAX = 4;
+    const int FAVORITES_MAX = 12;
+    const float HERO_ANCHOR = 0.30f;
+
+    enum Zone {
+        NAV = 0,
+        HERO = 1,
+        RAIL = 2   // RAIL + i: rail i
+    };
+
+    enum NavItem {
+        NAV_HOME,
+        NAV_LIVE,
+        NAV_MOVIES,
+        NAV_SERIES,
+        NAV_SEARCH,
+        NAV_FAVORITES,
+        NAV_DOWNLOADS,
+        NAV_SETTINGS
+    };
+
+    enum class RailKind {
+        Continue,
+        Recent,
+        Favorites
+    };
+
+    enum class ItemKind {
+        History,      // Continue Watching / Recently Watched entry
+        Channel,      // favorite channel (index into the live catalog)
+        Movie,        // favorite movie (index into the movie catalog)
+        Series        // favorite series
+    };
+
+    struct RailItem {
+        ItemKind kind = ItemKind::History;
+        HistoryEntry history;
+        int index = -1;
+        bool recent = false;   // a Recently Watched card: identity only (app/home_cards.h)
+    };
+
+    // one media card of a rail: [poster or logo area | title, second line, third line, progress] on a neutral surface
+    struct Card {
+        RectangleShape *root = nullptr;   // the card surface, at its slot in the rail
+        RectangleShape *ring = nullptr;   // accent focus ring a few px outside the card (hidden at rest)
+        ui::PosterView *poster = nullptr; // movies / episodes / series: the whole poster
+        ui::LogoView *logo = nullptr;     // channels: the logo contained in a neutral area
+        ui::Label *title = nullptr;
+        ui::Label *meta = nullptr;        // episode code / kind
+        ui::Label *detail = nullptr;      // time left / watched / year / channel number
+        ui::ProgressBar *bar = nullptr;    // in-progress movies and episodes
+        std::string image;        // what the artwork shows (for rebinding when images arrive)
+        images::ArtMeta art;      // TMDB backfill metadata (empty for live channels)
+        bool live = false;
+        bool focused = false;
+    };
+
+    struct Rail {
+        RailKind kind;
+        RectangleShape *layer = nullptr;   // the cards, moved horizontally by whole cards
+        ui::Label *heading = nullptr;
+        ui::Label *more = nullptr;          // "›" right of the cards: more items off-screen (Continue / Recent)
+        ui::Label *empty = nullptr;
+        std::vector<RailItem> items;
+        std::vector<Card> cards;
+        float y = 0;
+        int first = 0;
+        int index = 0;
+    };
+
+    // one primary section of the navigation: text at rest, an accent underline when it is the current section,
+    // an accent pill while focused (nothing boxed at rest)
+    class NavTab : public RectangleShape {
+    public:
+        NavTab(const std::string &text, float x, float h) : RectangleShape(FloatRect(x, 0, 1, h)) {
+            setCornersRadius(h / 2);
+            setCornerPointCount(10);
+            caption = new ui::Label(text, theme::BODY, ui::Weight::Regular, theme::textSecondary());
+            caption->setWeight(ui::Weight::SemiBold);   // measured at the widest weight: no width jump on focus
+            float w = std::round(caption->width() + 2 * L::TAB_PAD);
+            setSize(w, h);
+            caption->setAlign(ui::Align::Center, w);
+            caption->setPosition(0, ui::Label::centerOffset(theme::BODY, h));
+            add(caption);
+            underline = new RectangleShape(FloatRect(L::TAB_PAD, h - 7, w - 2 * L::TAB_PAD, 3));
+            underline->setCornersRadius(1.5f);
+            underline->setCornerPointCount(4);
+            add(underline);
+            setState(false, false);
+        }
+
+        void setState(bool current, bool focused) {
+            ui::focus::Look l = ui::focus::look(ui::focus::Role::NavTab, focused, current);
+            setFillColor(ui::focus::color(l.fill));
+            caption->setWeight(current || focused ? ui::Weight::SemiBold : ui::Weight::Regular);
+            caption->setColor(ui::focus::color(l.text));
+            underline->setFillColor(theme::accent());
+            underline->setVisibility(current && !focused ? Visibility::Visible : Visibility::Hidden);
+        }
+
+        float width() const { return getSize().x; }
+
+    private:
+        ui::Label *caption = nullptr;
+        RectangleShape *underline = nullptr;
+    };
+
+    class HomeScreen : public Screen {
+    public:
+        explicit HomeScreen(App &a) : Screen(a) {
+            // a flat page (not the vertical background gradient): the hero's fades end in exactly this colour, so
+            // they leave no faint contour where the page is a level or two lighter than the fade colour
+            ui::box(this, FloatRect(0, 0, theme::SCREEN_W, theme::SCREEN_H), theme::background(), 0);
+            const Session &s = app.session();
+            playlist = s.profile.isPlaylist();
+
+            // ---- scrolling page: backdrop, hero, rails
+            page = new RectangleShape(FloatRect(0, 0, theme::SCREEN_W, theme::SCREEN_H));
+            page->setFillColor(theme::none());
+            add(page);
+            backdrop = new ui::Backdrop(FloatRect(L::BACKDROP_X, 0, theme::SCREEN_W - L::BACKDROP_X, L::BACKDROP_H),
+                                        L::BACKDROP_FADE_LEFT, L::BACKDROP_FADE_BOTTOM, L::BACKDROP_FADE_TOP);
+            backdrop->setAnchor(HERO_ANCHOR);
+            page->add(backdrop);
+            buildShowcase();   // above the backdrop's fades: the poster is never faded
+            buildHero();
+            rails.push_back({RailKind::Continue});
+            rails.push_back({RailKind::Recent});
+            rails.push_back({RailKind::Favorites});
+            for (size_t i = 0; i < rails.size(); i++) {
+                buildRail(rails[i], L::RAILS_Y + (float) i * L::RAIL_PITCH);
+            }
+
+            // ---- fixed chrome: the page slides under a band behind the navigation and the hints
+            screens::bottomFade(this);
+            topSolid = ui::box(this, FloatRect(0, 0, theme::SCREEN_W, L::NAV_BAND_H), theme::background(), 0);
+            topFade = ui::fade(this, FloatRect(0, L::NAV_BAND_H, theme::SCREEN_W, L::NAV_FADE_H), theme::background(),
+                               ui::Edge::Top);
+            topSolid->setVisibility(Visibility::Hidden);   // shown once the page has scrolled (see layoutPage)
+            topFade->setVisibility(Visibility::Hidden);
+
+            // ---- the navigation: the ZIM TV logo, the sections, the icon actions and the clock
+            float nx = theme::SAFE_X + 190.0f;
+            logoTex = new c2d::C2DTexture(app.romfs() + "assets/zimtv_logo.png");
+            if (logoTex && logoTex->available) {
+                float logoH = layout::home::LOGO_H;
+                float lw = logoH * logoTex->getSize().x / logoTex->getSize().y;
+                auto *logo = new RectangleShape(Vector2f(lw, logoH));
+                logo->setTexture(logoTex, true);
+                logo->setPosition(theme::SAFE_X, layout::home::LOGO_Y);
+                add(logo);
+                nx = theme::SAFE_X + lw + 40.0f;
+            } else {
+                ui::label(this, "ZIM", 44, theme::SAFE_X, layout::home::LOGO_Y + 22, ui::Weight::SemiBold, theme::accent());
+                ui::label(this, "TV", 44, theme::SAFE_X, layout::home::LOGO_Y + 66, ui::Weight::SemiBold, theme::textStrong());
+                if (logoTex) { delete logoTex; logoTex = nullptr; }
+            }
+            std::vector<std::string> sections = {tr("nav.home"), tr("home.live_tv"), tr("home.movies"), tr("home.series")};
+            navIds = {NAV_HOME, NAV_LIVE, NAV_MOVIES, NAV_SERIES};
+            for (const std::string &text: sections) {
+                auto *tab = new NavTab(text, nx, layout::home::TAB_H);
+                tab->setPosition(nx, layout::home::TAB_Y);
+                add(tab);
+                tabs.push_back(tab);
+                nx += tab->width() + layout::home::TAB_GAP + 18;
+            }
+            clockLabel = ui::label(this, "", theme::BODY, 0, layout::home::CLOCK_Y, ui::Weight::Regular,
+                                   theme::textSecondary());
+            clockLabel->setAlign(ui::Align::Right, layout::SAFE_RIGHT);
+
+            // under the navigation, only when there is something to know: offline, plain HTTP, account expiring
+            std::string notice;
+            int64_t now = clockx::unixNow();
+            if (s.offline) {
+                notice = tr("home.offline_notice");
+            } else if (s.httpsWarning) {
+                notice = tr("home.https_notice");
+            } else if (s.account.expiresAt > 0 && s.account.expiresAt - now < 7 * 86400) {
+                notice = tr("home.expiry_notice", {clockx::localDate(s.account.expiresAt)});
+            }
+            if (!notice.empty()) {
+                auto *n = ui::label(this, notice, theme::CAPTION, theme::SAFE_X,
+                                    layout::home::NAV_Y + layout::home::NAV_H + 4, ui::Weight::SemiBold, theme::warning());
+                n->setMaxWidth(900);
+            }
+
+            hints = screens::hintBar(this, {});
+            rebuildRows();
+            zone = HERO;
+            refresh();
+            requestImages();
+        }
+
+        const char *name() const override { return "home"; }
+
+        void onResume() override {
+            rebuildRows();
+            refresh();
+            requestImages();
+        }
+
+        void onPause() override {
+            app.images().want(std::vector<ImageRequest>());
+        }
+
+        bool animating() const override {
+            return std::fabs(scrollPos - scrollTarget) > 0.5f;
+        }
+
+        void tick(double t) override {
+            std::string time = clockx::localTime();
+            if (time != clockText) {
+                clockText = time;
+                clockLabel->setText(time);
+                redraw();
+            }
+            if (app.library().generation() != libraryGen || app.vod().generation() != vodGen
+                || app.session().liveGeneration != liveGen) {
+                rebuildRows();
+                refresh();
+                requestImages();
+                redraw();
+            } else if (app.images().generation() != imageGen) {
+                bindImages();   // textures arrived: re-bind only the artwork
+                redraw();
+            }
+            // the page glides to its target (Smooth scrolling), at most 1/60 s steps
+            if (animating()) {
+                double dt = lastTick > 0 ? std::min(0.05, t - lastTick) : 1.0 / 60;
+                float k = (float) std::min(1.0, dt * 14.0);
+                scrollPos += (scrollTarget - scrollPos) * k;
+                if (std::fabs(scrollPos - scrollTarget) <= 0.5f) {
+                    scrollPos = scrollTarget;
+                }
+                page->setPosition(0, -std::round(scrollPos));
+                redraw();
+            }
+            lastTick = t;
+        }
+
+        void handleInput(const InputEvent &e) override {
+            switch (e.button) {
+                case PadButton::Left:
+                    moveFocus(-1);
+                    break;
+                case PadButton::Right:
+                    moveFocus(1);
+                    break;
+                case PadButton::L1:
+                case PadButton::R1:
+                    // straight through the navigation from anywhere on the Home (app/home_nav.h)
+                    if (e.repeat && zone != NAV) {
+                        return;
+                    }
+                    navIndex = homenav::shoulder(navIndex, (int) navIds.size(), e.button == PadButton::L1 ? -1 : 1);
+                    zone = NAV;
+                    break;
+                case PadButton::Down:
+                    if (e.repeat) {
+                        return;   // rails are a few zones: one press each
+                    }
+                    for (int z = zone + 1; z < RAIL + (int) rails.size(); z++) {
+                        if (zoneSize(z) > 0) {
+                            zone = z;
+                            break;
+                        }
+                    }
+                    break;
+                case PadButton::Up:
+                    if (e.repeat) {
+                        return;
+                    }
+                    for (int z = zone - 1; z >= NAV; z--) {
+                        if (zoneSize(z) > 0) {
+                            zone = z;
+                            break;
+                        }
+                    }
+                    break;
+                case PadButton::Cross:
+                    if (!e.repeat) {
+                        activate();
+                    }
+                    return;
+                case PadButton::Triangle:
+                    if (!e.repeat) {
+                        openNav(NAV_SEARCH);
+                    }
+                    return;
+                case PadButton::Square:
+                    // Remove the focused card of Continue Watching / Recently Watched. A copy of the entry is taken
+                    // now, before the row is rebuilt: the row re-indexes after the removal, and a held key never
+                    // repeats (one card per press).
+                    if (!e.repeat && zone >= RAIL) {
+                        Rail &r = rails[(size_t) (zone - RAIL)];
+                        if (r.index < (int) r.items.size() && r.items[(size_t) r.index].kind == ItemKind::History) {
+                            const HistoryEntry focused = r.items[(size_t) r.index].history;
+                            if (r.kind == RailKind::Continue) {
+                                removeFromContinueWatching(focused);
+                            } else if (r.kind == RailKind::Recent) {
+                                removeFromRecentlyWatched(focused);
+                            }
+                        }
+                    }
+                    return;
+                case PadButton::Options:
+                    if (!e.repeat) {
+                        openNav(NAV_SETTINGS);
+                    }
+                    return;
+                case PadButton::Circle:
+                    // Duplecast-style: Circle opens the sources screen (never an accidental exit); the user can go
+                    // back to the Home from there with Circle.
+                    if (!e.repeat) {
+                        app.push(screens::makeUsers(app));
+                    }
+                    return;
+                default:
+                    return;
+            }
+            refresh();
+        }
+
+    private:
+        // ------------------------------------------------------------------ building
+        void buildHero() {
+            eyebrow = ui::label(page, "", theme::LABEL, L::TEXT_X, 0, ui::Weight::SemiBold, theme::accentText());
+            eyebrow->setMaxWidth(L::TEXT_W);
+            heroTitle = ui::label(page, "", theme::DISPLAY, L::TEXT_X, 0, ui::Weight::SemiBold, theme::textStrong());
+            heroTitle->setMaxWidth(L::TEXT_W);
+            heroTitle->setMaxLines(2);
+            heroSubtitle = ui::label(page, "", theme::BODY, L::TEXT_X, 0, ui::Weight::Regular, theme::textPrimary());
+            heroSubtitle->setMaxWidth(L::TEXT_W);
+            heroSubtitle->setMaxLines(2);
+            heroMeta = ui::label(page, "", theme::LABEL, L::TEXT_X, 0, ui::Weight::Regular, theme::textSecondary());
+            heroMeta->setMaxWidth(L::TEXT_W);
+            const float barY = L::BUTTONS_Y - L::PROGRESS_TO_BUTTONS;
+            heroBar = new ui::ProgressBar(FloatRect(L::TEXT_X, barY, L::PROGRESS_W, theme::PROGRESS_H));
+            page->add(heroBar);
+            heroTime = ui::label(page, "", theme::CAPTION, L::TEXT_X + L::PROGRESS_W + 20,
+                                 barY + theme::PROGRESS_H / 2 - std::round(theme::CAPTION * 1.25f / 2),
+                                 ui::Weight::SemiBold, theme::textSecondary());
+            for (int i = 0; i < HERO_BUTTONS; i++) {
+                heroButtons[i] = new ui::Button("", FloatRect(0, L::BUTTONS_Y, L::SECONDARY_W, L::BUTTON_H), i == 0);
+                page->add(heroButtons[i]);
+            }
+        }
+
+        void buildRail(Rail &r, float y) {
+            r.y = y;
+            const char *key = r.kind == RailKind::Continue ? "home.continue_watching"
+                              : r.kind == RailKind::Recent ? "home.recently_watched" : "home.favorites";
+            r.heading = ui::label(page, tr(key), theme::HEADING - 2, theme::SAFE_X, y, ui::Weight::SemiBold,
+                                  theme::textStrong());
+            r.layer = new RectangleShape(FloatRect(theme::SAFE_X, y + L::RAIL_HEADING_H, theme::CONTENT_W, L::CARD_H));
+            r.layer->setFillColor(theme::none());
+            page->add(r.layer);
+            r.empty = ui::label(page, "", theme::BODY, theme::SAFE_X, y + L::RAIL_HEADING_H + 8, ui::Weight::Regular,
+                                theme::textMuted());
+            r.empty->setMaxWidth(theme::CONTENT_W);
+            r.empty->setMaxLines(2);
+            if (r.kind == RailKind::Continue || r.kind == RailKind::Recent) {
+                // a quiet chevron when more items lie off-screen (never accent): on the heading line, its right edge
+                // at the rail's right edge - inside the TV-safe area, never over a card
+                r.more = ui::label(page, "\xE2\x80\xBA", theme::DISPLAY, 0, 0, ui::Weight::Regular, theme::textMuted());
+                r.more->setAlign(ui::Align::Right, L::RAIL_MORE_RIGHT);
+                r.more->setPosition(0, y + L::RAIL_MORE_CENTER_Y - std::round(r.more->height() / 2));
+                r.more->setVisibility(Visibility::Hidden);
+            }
+        }
+
+        // ------------------------------------------------------------------ data
+        int zoneSize(int z) const {
+            if (z == NAV) {
+                return (int) navIds.size();
+            }
+            if (z == HERO) {
+                return heroCount;
+            }
+            return (int) rails[(size_t) (z - RAIL)].items.size();
+        }
+
+        static std::string titleOf(const HistoryEntry &h) {
+            return h.type == iptv::ContentType::Series && !h.seriesName.empty() ? h.seriesName : h.name;
+        }
+
+        static std::string episodeLine(const HistoryEntry &h) {
+            return homecards::episodeLine(h);
+        }
+
+        static bool isUpNext(const HistoryEntry &h) {
+            return homecards::isUpNext(h);
+        }
+
+        static std::string timeLine(const HistoryEntry &h) {
+            return h.duration > 0 ? fmt::clock(h.position) + " / " + fmt::clock(h.duration) : fmt::clock(h.position);
+        }
+
+        void rebuildRows() {
+            vodGen = app.vod().generation();
+            libraryGen = app.library().generation();
+            liveGen = app.session().liveGeneration;
+            imageGen = app.images().generation();
+            for (Rail &r: rails) {
+                r.items.clear();
+                switch (r.kind) {
+                    case RailKind::Continue:
+                        for (const HistoryEntry *h: app.library().continueWatching((size_t) CW_MAX)) {
+                            if (h->type == iptv::ContentType::Live) {
+                                continue;   // Continue Watching is movies / episodes only
+                            }
+                            RailItem it;
+                            it.history = *h;
+                            r.items.push_back(it);
+                        }
+                        break;
+                    case RailKind::Recent:
+                        for (const HistoryEntry *h: app.library().recentlyWatched((size_t) RECENT_MAX, (size_t) RECENT_LIVE_MAX)) {
+                            RailItem it;
+                            it.history = *h;
+                            it.recent = true;
+                            r.items.push_back(it);
+                        }
+                        break;
+                    case RailKind::Favorites:
+                        collectFavorites(r.items);
+                        break;
+                }
+                buildCards(r);
+                r.index = std::min(r.index, std::max(0, (int) r.items.size() - 1));
+                r.first = std::min(r.first, std::max(0, (int) r.items.size() - L::CARDS_VISIBLE));
+            }
+            hero = nullptr;
+            if (!rails.empty() && rails[0].kind == RailKind::Continue && !rails[0].items.empty()) {
+                heroEntry = rails[0].items[0].history;
+                hero = &heroEntry;
+            }
+            bindHero();
+            if (zoneSize(zone) == 0) {
+                zone = HERO;
+            }
+        }
+
+        void collectFavorites(std::vector<RailItem> &out) {
+            const Session &s = app.session();
+            size_t total = 0;
+            for (iptv::ContentType t: {iptv::ContentType::Live, iptv::ContentType::Movie, iptv::ContentType::Series}) {
+                total += app.library().favorites(t).size();
+            }
+            favoritesTotal = total;
+            if (total == 0) {
+                return;
+            }
+            auto add = [&out](ItemKind kind, const std::vector<int> &indices) {
+                for (int i: indices) {
+                    if ((int) out.size() >= FAVORITES_MAX) {
+                        return;
+                    }
+                    RailItem it;
+                    it.kind = kind;
+                    it.index = i;
+                    out.push_back(it);
+                }
+            };
+            if (s.liveLoaded) {
+                add(ItemKind::Channel, s.live.favorites(app.library().favorites(iptv::ContentType::Live)));
+            }
+            // only catalogs already in memory: Home never starts a catalog load
+            add(ItemKind::Movie, app.vod().movies().favorites(app.library().favorites(iptv::ContentType::Movie)));
+            add(ItemKind::Series, app.vod().series().favorites(app.library().favorites(iptv::ContentType::Series)));
+        }
+
+        // artwork, title and two lines of one rail item; art carries the TMDB backfill metadata when known
+        void describe(const RailItem &it, std::string &title, std::string &second, std::string &third,
+                      std::string &image, images::ArtMeta &art, bool &live, float &progress) const {
+            art = images::ArtMeta();
+            live = false;
+            progress = 0;
+            switch (it.kind) {
+                case ItemKind::History: {
+                    const HistoryEntry &h = it.history;
+                    title = titleOf(h);
+                    image = h.icon;
+                    live = h.type == iptv::ContentType::Live;
+                    if (live && it.recent) {
+                        const iptv::LiveChannel *c = app.session().live.find(h.id);
+                        if (c && c->num > 0) {
+                            third = std::to_string(c->num);
+                        }
+                    }
+                    if (h.type == iptv::ContentType::Movie) {
+                        if (const iptv::Movie *m = app.vod().movies().find(h.id)) {
+                            art.year = m->year;
+                        }
+                    } else if (h.type == iptv::ContentType::Series) {
+                        if (const iptv::Series *sv = app.vod().series().find(h.seriesId.empty() ? h.id : h.seriesId)) {
+                            art.year = sv->year;
+                        }
+                    }
+                    art.title = live ? std::string() : title;
+                    art.subject = h.type == iptv::ContentType::Movie ? 1 : h.type == iptv::ContentType::Series ? 2 : 0;
+                    // Continue Watching: where playback stopped; Recently Watched: what it is (app/home_cards.h)
+                    homecards::Text t = homecards::historyCard(h, it.recent ? homecards::Rail::Recent : homecards::Rail::Continue,
+                                                               third);
+                    second = t.second;
+                    third = t.third;
+                    progress = t.progress;
+                    return;
+                }
+                case ItemKind::Channel: {
+                    const iptv::LiveChannel &c = app.session().live.channels()[(size_t) it.index];
+                    title = c.name;
+                    second = tr("home.kind_live");
+                    third = c.num > 0 ? std::to_string(c.num) : "";
+                    image = c.icon;
+                    live = true;
+                    return;
+                }
+                case ItemKind::Movie: {
+                    const iptv::Movie &m = app.vod().movies().items()[(size_t) it.index];
+                    title = m.title;
+                    second = tr("home.kind_movie");
+                    third = m.year > 0 ? std::to_string(m.year) : "";
+                    image = m.icon;
+                    art.title = m.title;
+                    art.year = m.year;
+                    art.subject = 1;
+                    return;
+                }
+                case ItemKind::Series: {
+                    const iptv::Series &s = app.vod().series().items()[(size_t) it.index];
+                    title = s.title;
+                    second = tr("home.kind_series");
+                    third = s.year > 0 ? std::to_string(s.year) : "";
+                    image = s.cover;
+                    art.title = s.title;
+                    art.year = s.year;
+                    art.subject = 2;
+                    return;
+                }
+            }
+        }
+
+        void buildCards(Rail &r) {
+            for (auto *c: r.layer->getChilds()) {
+                r.layer->remove(c);
+                delete c;
+            }
+            r.cards.clear();
+            for (size_t i = 0; i < r.items.size(); i++) {
+                const RailItem &it = r.items[i];
+                std::string title, second, third, image;
+                images::ArtMeta art;
+                bool live = false;
+                float progress = 0;
+                describe(it, title, second, third, image, art, live, progress);
+                Card c;
+                c.image = image;
+                c.art = art;
+                c.live = live;
+                c.root = ui::box(r.layer, FloatRect((float) i * (L::CARD_W + L::CARD_GAP), 0, L::CARD_W, L::CARD_H),
+                                 theme::card(), theme::RADIUS);
+                const float g = L::CARD_RING_GAP;
+                c.ring = ui::box(c.root, FloatRect(-g, -g, L::CARD_W + 2 * g, L::CARD_H + 2 * g), theme::none(),
+                                 theme::RADIUS + g);
+                c.ring->setOutlineColor(theme::accent());
+                c.ring->setOutlineThickness(theme::FOCUS_BORDER);
+                c.ring->setVisibility(Visibility::Hidden);
+                const FloatRect artRect(0, 0, L::CARD_ART_W, L::CARD_H);
+                if (live) {
+                    // the logo whole, centred in a neutral area (never cropped, never stretched into artwork)
+                    c.logo = new ui::LogoView(artRect, theme::DISPLAY, L::CARD_LOGO_PAD, 1.6f);
+                    c.logo->setCornersRadius(theme::RADIUS);
+                    c.root->add(c.logo);
+                } else {
+                    // the whole poster at the size of its texture (ui/image_fit.h Poster: no 16:9 crop)
+                    c.poster = new ui::PosterView(artRect, theme::LABEL);
+                    c.poster->setCornersRadius(theme::RADIUS);
+                    c.root->add(c.poster);
+                }
+                const float tx = L::CARD_TEXT_X;
+                float ty = L::CARD_PAD - 4;
+                c.title = ui::label(c.root, title, theme::BODY, tx, ty, ui::Weight::SemiBold, theme::textPrimary());
+                c.title->setMaxWidth(L::CARD_TEXT_W);
+                c.title->setMaxLines(2);
+                ty += c.title->height() + 8;
+                c.meta = ui::label(c.root, second, theme::LABEL, tx, ty, ui::Weight::Regular, theme::textSecondary());
+                c.meta->setMaxWidth(L::CARD_TEXT_W);
+                ty += second.empty() ? 0 : c.meta->height() + 4;
+                c.detail = ui::label(c.root, third, theme::CAPTION, tx, ty, ui::Weight::Regular, theme::textMuted());
+                c.detail->setMaxWidth(L::CARD_TEXT_W);
+                c.detail->setMaxLines(1);
+                if (progress > 0) {
+                    c.bar = new ui::ProgressBar(FloatRect(tx, L::CARD_H - L::CARD_PAD - theme::PROGRESS_H, L::CARD_TEXT_W,
+                                                          theme::PROGRESS_H));
+                    c.bar->setFraction(progress);
+                    c.root->add(c.bar);
+                }
+                r.cards.push_back(c);
+                bindCardImage(r.cards.back(), title);
+            }
+            const char *emptyKey = r.kind == RailKind::Continue ? "home.continue_empty"
+                                   : r.kind == RailKind::Recent ? "home.recent_empty" : "home.favorites_empty";
+            // favorites exist but only movies / series whose section was not opened yet: say why they are missing
+            if (r.kind == RailKind::Favorites && r.items.empty() && favoritesTotal > 0) {
+                emptyKey = "home.favorites_more";
+            }
+            r.empty->setText(r.items.empty() ? tr(emptyKey) : "");
+        }
+
+        // movies / episodes: the grid poster, whose texture is exactly the card's poster area (1:1); channels: the
+        // large logo variant, contained
+        void bindCardImage(Card &c, const std::string &title) {
+            if (c.logo) {
+                std::shared_ptr<ImageSet> img = app.images().get(ImageKind::Logo, c.image);
+                bool large = img && img->variants.size() > 1;
+                c.logo->set(title, img ? img->at(large ? 1 : 0).texture : nullptr,
+                            img ? img->at(large ? 1 : 0).size : Vector2i());
+            } else if (c.poster) {
+                std::shared_ptr<ImageSet> img = app.images().get(ImageKind::Poster, c.image, c.art);
+                c.poster->set(title, img ? img->at(0).texture : nullptr, img ? img->at(0).size : Vector2i());
+            }
+        }
+
+        // images arrived: only the artwork is bound again (no labels are rebuilt)
+        void bindImages() {
+            imageGen = app.images().generation();
+            for (Rail &r: rails) {
+                for (size_t i = 0; i < r.cards.size() && i < r.items.size(); i++) {
+                    Card &c = r.cards[i];
+                    std::string title, second, third, image;
+                    images::ArtMeta art;
+                    bool live = false;
+                    float progress = 0;
+                    describe(r.items[i], title, second, third, image, art, live, progress);
+                    c.art = art;
+                    if (c.logo) {
+                        std::shared_ptr<ImageSet> img = app.images().get(ImageKind::Logo, c.image);
+                        bool large = img && img->variants.size() > 1;
+                        c.logo->set(title, img ? img->at(large ? 1 : 0).texture : nullptr,
+                                    img ? img->at(large ? 1 : 0).size : Vector2i());
+                    } else if (c.poster) {
+                        std::shared_ptr<ImageSet> img = app.images().get(ImageKind::Poster, c.image, c.art);
+                        c.poster->set(title, img ? img->at(0).texture : nullptr, img ? img->at(0).size : Vector2i());
+                    }
+                }
+            }
+            bindHeroImages();
+        }
+
+        // ------------------------------------------------------------------ hero
+        void bindHero() {
+            heroBar->setVisibility(Visibility::Hidden);
+            heroTime->setText("");
+            if (hero) {
+                const HistoryEntry &h = *hero;
+                eyebrow->setText(tr("home.continue_watching"));
+                heroTitle->setText(titleOf(h));
+                heroSubtitle->setText(h.type == iptv::ContentType::Series ? episodeLine(h) : "");
+                if (isUpNext(h)) {
+                    // the series' next episode, not started yet: no progress to show
+                    heroMeta->setText(tr("home.kind_series") + "   \xC2\xB7   " + tr("home.up_next"));
+                } else {
+                    std::string left = fmt::remaining(h.position, h.duration);
+                    heroMeta->setText(tr(h.type == iptv::ContentType::Series ? "home.kind_series" : "home.kind_movie")
+                                      + (left.empty() ? "" : "   \xC2\xB7   " + left));
+                    heroBar->setFraction(std::max(0.02f, (float) progress::fraction(h.position, h.duration)));
+                    heroBar->setVisibility(Visibility::Visible);
+                    heroTime->setText(timeLine(h));
+                }
+                heroIds = {HERO_RESUME, HERO_DETAILS};
+            } else {
+                eyebrow->setText(tr("app.name"));
+                heroTitle->setText(tr("home.hero_start_title"));
+                heroSubtitle->setText(tr(playlist ? "home.hero_start_text_playlist" : "home.hero_start_text"));
+                heroMeta->setText(sectionCounts());
+                heroIds = {HERO_LIVE, HERO_MOVIES, HERO_SERIES};
+            }
+            heroCount = (int) heroIds.size();
+            requestHeroInfo();
+            // the text stack hangs above the buttons (they keep their line): meta, episode, title, eyebrow
+            float y = hero ? L::BUTTONS_Y - L::PROGRESS_TO_BUTTONS - 22 : L::BUTTONS_Y - 40;
+            if (!heroMeta->getText().empty()) {
+                y -= heroMeta->height();
+                heroMeta->setPosition(L::TEXT_X, y);
+                y -= 6;
+            }
+            if (!heroSubtitle->getText().empty()) {
+                y -= heroSubtitle->height();
+                heroSubtitle->setPosition(L::TEXT_X, y);
+                y -= 8;
+            }
+            y -= heroTitle->height();
+            heroTitle->setPosition(L::TEXT_X, y);
+            y -= 6 + eyebrow->height();
+            eyebrow->setPosition(L::TEXT_X, y);
+            float x = L::TEXT_X;
+            for (int i = 0; i < HERO_BUTTONS; i++) {
+                bool shown = i < heroCount;
+                heroButtons[i]->setVisibility(shown ? Visibility::Visible : Visibility::Hidden);
+                if (shown) {
+                    float w = i == 0 && hero ? L::RESUME_W : L::SECONDARY_W;
+                    heroButtons[i]->setWidth(w);
+                    heroButtons[i]->setText(heroButtonText(i));
+                    heroButtons[i]->setPrimary(i == 0);
+                    heroButtons[i]->setPosition(x, L::BUTTONS_Y);
+                    x += w + L::BUTTON_GAP;
+                }
+            }
+            bindHeroImages();
+        }
+
+        std::string heroButtonText(int i) const {
+            if (hero) {
+                if (i != 0) {
+                    return tr("home.hero_details");
+                }
+                return "\xE2\x96\xB6  " + (isUpNext(*hero) ? tr("home.hero_play_next", {fmt::episodeCode(hero->season,
+                                                                                                 hero->episode)})
+                                                             : tr("home.hero_resume_at", {fmt::clock(hero->position)}));
+            }
+            switch (heroIds[(size_t) i]) {
+                case HERO_LIVE:
+                    return tr("home.live_tv");
+                case HERO_MOVIES:
+                    return tr("home.movies");
+                case HERO_SERIES:
+                    return tr("home.series");
+                default:
+                    return tr("home.search");
+            }
+        }
+
+        // "1.362 canais · 16.440 filmes · 8.838 séries" for what is loaded (never a load just for the count)
+        std::string sectionCounts() const {
+            const Session &s = app.session();
+            std::string out;
+            auto addPart = [&out](const std::string &p) {
+                if (!p.empty()) {
+                    out += (out.empty() ? "" : "   \xC2\xB7   ") + p;
+                }
+            };
+            if (s.liveLoaded) {
+                addPart(i18n::count("home.channels", (long long) s.live.channels().size()));
+            }
+            if (!app.vod().movies().empty()) {
+                addPart(i18n::count("home.movie_count", (long long) app.vod().movies().size()));
+            }
+            if (!app.vod().series().empty()) {
+                addPart(i18n::count("home.series_count", (long long) app.vod().series().size()));
+            }
+            return out;
+        }
+
+        // the hero's real landscape backdrop: backdrop_path of the item's get_vod_info / get_series_info, when the
+        // provider sends one and the response is cached ("" otherwise: the poster is used)
+        std::string heroBackdropUrl() const {
+            if (!hero) {
+                return "";
+            }
+            if (hero->type == iptv::ContentType::Movie) {
+                std::shared_ptr<const iptv::MovieInfo> info = app.vod().movieInfo(hero->id);
+                return info ? info->backdrop : "";
+            }
+            if (hero->type == iptv::ContentType::Series) {
+                std::shared_ptr<const iptv::SeriesInfo> info = app.vod().seriesInfo(hero->seriesId);
+                return info ? info->series.backdrop : "";
+            }
+            return "";
+        }
+
+        // one detail request for the hero item (the same one its Details page makes, cached by VodLibrary), at most
+        // once per item while the Home lives: a failing request is never retried in a loop
+        void requestHeroInfo() {
+            if (!hero || !app.settings().get().loadImages) {
+                return;
+            }
+            std::string key = (hero->type == iptv::ContentType::Series ? "s" + hero->seriesId : "m" + hero->id);
+            if (key == heroInfoRequested) {
+                return;
+            }
+            heroInfoRequested = key;
+            if (hero->type == iptv::ContentType::Movie) {
+                app.vod().requestMovieInfo(app.session().profile, hero->id);
+            } else if (hero->type == iptv::ContentType::Series) {
+                app.vod().requestSeriesInfo(app.session().profile, hero->seriesId);
+            }
+        }
+
+        // the showcase poster: a soft shadow, the poster (rounded like the poster tiles), a thin frame
+        void buildShowcase() {
+            showcase = new RectangleShape(FloatRect(0, 0, 1, 1));
+            showcase->setFillColor(theme::none());
+            page->add(showcase);
+            showcaseShadow = ui::box(showcase, FloatRect(0, L::SHOWCASE_SHADOW_Y, 1, 1),
+                                     theme::withAlpha(theme::videoBackground(), (uint8_t) L::SHOWCASE_SHADOW_ALPHA),
+                                     L::SHOWCASE_RADIUS + 4);
+            showcaseImage = new RectangleShape(FloatRect(0, 0, 1, 1));
+            showcaseImage->setCornersRadius(L::SHOWCASE_RADIUS);
+            showcaseImage->setCornerPointCount(8);
+            const uint8_t t = (uint8_t) L::SHOWCASE_TINT;
+            showcaseImage->setFillColor(Color(t, t, t, 255));   // texture modulation: 94 %, nearly untouched
+            showcase->add(showcaseImage);
+            showcaseFrame = ui::box(showcase, FloatRect(0, 0, 1, 1), theme::none(), L::SHOWCASE_RADIUS);
+            showcaseFrame->setOutlineColor(theme::divider());
+            showcaseFrame->setOutlineThickness(1.5f);
+            showcase->setVisibility(Visibility::Hidden);
+        }
+
+        // ---- hero artwork (see the top of this file)
+        struct HeroArt {
+            std::shared_ptr<ImageSet> art;   // what to draw (nullptr: the clean dark hero)
+            std::string backdropUrl;         // the provider's backdrop_path ("" when none or not known yet)
+            bool backdropFailed = false;
+            std::shared_ptr<ImageSet> backdropSet;
+            std::string coverUrl;            // the detail cover when it differs from the list image ("" otherwise)
+            images::hero::Plan plan;
+        };
+
+        // the detail cover of the hero item (movies: cover_big / movie_image of get_vod_info; series: the cover of
+        // get_series_info), when the provider has one that differs from the list image
+        std::string heroCoverUrl() const {
+            std::string c;
+            if (hero->type == iptv::ContentType::Movie) {
+                std::shared_ptr<const iptv::MovieInfo> info = app.vod().movieInfo(hero->id);
+                c = info ? info->coverBig : "";
+            } else if (hero->type == iptv::ContentType::Series) {
+                std::shared_ptr<const iptv::SeriesInfo> info = app.vod().seriesInfo(hero->seriesId);
+                c = info ? info->series.cover : "";
+            }
+            return c == hero->icon ? "" : c;
+        }
+
+        HeroArt heroArt() {
+            HeroArt h;
+            if (!hero) {
+                return h;
+            }
+            images::hero::Inputs in;
+            h.backdropUrl = heroBackdropUrl();
+            in.backdropKnown = !h.backdropUrl.empty();
+            if (in.backdropKnown) {
+                h.backdropFailed = in.backdropFailed = app.images().failed(ImageKind::Backdrop, h.backdropUrl);
+                h.backdropSet = h.backdropFailed ? nullptr : app.images().get(ImageKind::Backdrop, h.backdropUrl);
+                in.backdropLoaded = (bool) h.backdropSet;
+                in.backdropW = h.backdropSet ? h.backdropSet->source.x : 0;
+                in.backdropH = h.backdropSet ? h.backdropSet->source.y : 0;
+            }
+            h.coverUrl = heroCoverUrl();
+            in.coverKnown = !h.coverUrl.empty();
+            std::shared_ptr<ImageSet> cover;
+            if (in.coverKnown) {
+                in.coverFailed = app.images().failed(ImageKind::HeroPoster, h.coverUrl);
+                cover = app.images().get(ImageKind::HeroPoster, h.coverUrl);
+                in.coverLoaded = (bool) cover;
+            }
+            in.posterKnown = !hero->icon.empty();
+            std::shared_ptr<ImageSet> poster;
+            if (in.posterKnown) {
+                in.posterFailed = app.images().failed(ImageKind::HeroPoster, hero->icon);
+                poster = app.images().get(ImageKind::HeroPoster, hero->icon);
+                in.posterLoaded = (bool) poster;
+            }
+            h.plan = images::hero::plan(in);
+            switch (h.plan.show) {
+                case images::hero::Show::Backdrop:
+                    h.art = h.backdropSet;
+                    break;
+                case images::hero::Show::Cover:
+                    h.art = cover;
+                    break;
+                case images::hero::Show::Poster:
+                    h.art = poster;
+                    break;
+                default:
+                    break;
+            }
+            return h;
+        }
+
+        // the hero layer: the usable backdrop full-bleed, else the showcase poster on its ambient field, else the
+        // clean dark hero
+        void bindHeroImages() {
+            HeroArt h = heroArt();
+            if (h.plan.wantBackdrop != heroBackdropWanted) {
+                requestImages();   // the backdrop failed / turned out unusable: ask for the poster instead
+            }
+            showcaseShown = {};
+            if (!h.art) {
+                backdrop->set(nullptr, Vector2i(), ui::Backdrop::Art::Landscape);
+                showcase->setVisibility(Visibility::Hidden);
+                logHeroArt(h);
+                return;
+            }
+            if (h.plan.show == images::hero::Show::Backdrop) {
+                backdrop->setLevel((uint8_t) L::HERO_BACKDROP_TINT, (uint8_t) L::HERO_BACKDROP_SHADE);
+                backdrop->set(h.art->at(0).texture, h.art->at(0).size, ui::Backdrop::Art::Landscape);
+                showcase->setVisibility(Visibility::Hidden);
+                logHeroArt(h);
+                return;
+            }
+            // the showcase: the poster as a sharp object on the right, a subtle tint of its colour around it only
+            const ImageVariant &v = h.art->at(0);
+            showcaseShown = images::hero::showcase(v.size.x, v.size.y);
+            if (!showcaseShown.shown) {
+                backdrop->set(nullptr, Vector2i(), ui::Backdrop::Art::Landscape);   // too small: the clean dark hero
+                showcase->setVisibility(Visibility::Hidden);
+                logHeroArt(h);
+                return;
+            }
+            const Color page = theme::background();
+            images::hero::Rgb amb = images::hero::ambient({h.art->average.r, h.art->average.g, h.art->average.b},
+                                                          {(float) page.r, (float) page.g, (float) page.b});
+            images::hero::AmbientArea area = images::hero::ambientArea(showcaseShown);
+            backdrop->setAmbient(Color((uint8_t) amb.r, (uint8_t) amb.g, (uint8_t) amb.b, 255),
+                                 FloatRect(area.coreX - L::BACKDROP_X, area.coreY, area.coreW, area.coreH),
+                                 area.fadeLeft, area.fadeRight, area.fadeY);
+            if (showcaseTexture != v.texture) {
+                showcaseImage->setTexture(v.texture.get(), true);
+                showcaseTexture = v.texture;   // kept alive while it is shown
+            }
+            showcaseImage->setTextureRect(IntRect(0, 0, v.size.x, v.size.y));
+            const float w = showcaseShown.w;
+            const float hh = showcaseShown.h;
+            showcase->setPosition(showcaseShown.x, showcaseShown.y);
+            showcaseImage->setSize(w, hh);
+            showcaseImage->setCornersRadius(L::SHOWCASE_RADIUS);
+            showcaseShadow->setSize(w, hh);
+            showcaseFrame->setSize(w, hh);
+            showcase->setVisibility(Visibility::Visible);
+            logHeroArt(h);
+        }
+
+        // once per hero art change: why the hero looks the way it does (sizes - never a URL or a host)
+        void logHeroArt(const HeroArt &h) {
+            const void *id = h.art ? h.art->at(0).texture.get() : nullptr;
+            std::string key = std::string(hero ? hero->id : "") + (h.backdropUrl.empty() ? "0" : "1")
+                              + (h.backdropFailed ? "f" : "") + (h.backdropSet ? "l" : "")
+                              + (h.coverUrl.empty() ? "" : "c");
+            if (id == heroArtLogged && key == heroArtKey) {
+                return;
+            }
+            heroArtLogged = id;
+            heroArtKey = key;
+            if (!hero) {
+                return;
+            }
+            // i18n-exempt-begin: log values
+            const char *type = hero->type == iptv::ContentType::Series ? "series" : "movie";
+            const bool detailsKnown = hero->type == iptv::ContentType::Series
+                ? (bool) app.vod().seriesInfo(hero->seriesId) : (bool) app.vod().movieInfo(hero->id);
+            const char *available = h.backdropUrl.empty() ? (detailsKnown ? "no" : "unknown (details pending)") : "yes";
+            const char *usable = h.backdropUrl.empty() ? "-"
+                                 : h.backdropFailed ? "no (failed to load)"
+                                 : !h.backdropSet ? "loading"
+                                                  : h.plan.backdropUsable ? "yes" : "no (portrait or too small)";
+            if (!h.art) {
+                LOG_I("home", "hero art: %s, provider backdrop available %s, usable %s, detail cover %s - clean dark hero",
+                      type, available, usable, h.coverUrl.empty() ? "none" : "loading / failed");
+                return;
+            }
+            const ImageVariant &v = h.art->at(0);
+            if (h.plan.show == images::hero::Show::Backdrop) {
+                const ui::Backdrop::Shown &s = backdrop->shownArt();
+                LOG_I("home", "hero art: %s, provider backdrop available %s, usable %s -> backdrop: source %dx%d, texture "
+                              "%dx%d, drawn %.0fx%.0f (visible %.0fx%.0f, %.2fx), brightness tint %d shade %d", type,
+                      available, usable, h.art->source.x, h.art->source.y, v.size.x, v.size.y, s.drawn.w, s.drawn.h,
+                      s.inBox.w, s.inBox.h, s.scale, L::HERO_BACKDROP_TINT, L::HERO_BACKDROP_SHADE);
+                return;
+            }
+            const char *which = h.plan.show == images::hero::Show::Cover ? "detail cover" : "list image";
+            if (!showcaseShown.shown) {
+                LOG_I("home", "hero art: %s, provider backdrop available %s, usable %s -> showcase %s: source %dx%d, "
+                              "texture %dx%d under %.0f px - omitted, clean dark hero", type, available, usable, which,
+                      h.art->source.x, h.art->source.y, v.size.x, v.size.y, images::hero::SHOWCASE_MIN_H);
+                return;
+            }
+            LOG_I("home", "hero art: %s, provider backdrop available %s, usable %s -> showcase %s: source %dx%d, texture "
+                          "%dx%d, drawn %.0fx%.0f at %.0f,%.0f (%.2fx, never enlarged)", type, available, usable, which,
+                  h.art->source.x, h.art->source.y, v.size.x, v.size.y, showcaseShown.w, showcaseShown.h,
+                  showcaseShown.x, showcaseShown.y, showcaseShown.scale);
+            // i18n-exempt-end
+        }
+
+        // the hero's artwork, then the cards on screen in every rail (+ the next one): posters / logos
+        void requestImages() {
+            if (!app.settings().get().loadImages) {
+                return;
+            }
+            std::vector<ImageRequest> req;
+            heroBackdropWanted = false;
+            if (hero) {
+                HeroArt h = heroArt();
+                heroBackdropWanted = h.plan.wantBackdrop;
+                if (heroBackdropWanted) {
+                    req.push_back({ImageKind::Backdrop, h.backdropUrl});
+                }
+                if (h.plan.wantCover) {
+                    req.push_back({ImageKind::HeroPoster, h.coverUrl});
+                }
+                if (h.plan.wantPoster) {
+                    req.push_back({ImageKind::HeroPoster, hero->icon});
+                }
+            }
+            for (const Rail &r: rails) {
+                int last = std::min((int) r.cards.size(), r.first + L::CARDS_VISIBLE + 1);
+                for (int i = r.first; i < last; i++) {
+                    const Card &c = r.cards[(size_t) i];
+                    if (!c.image.empty()) {
+                        req.push_back({c.live ? ImageKind::Logo : ImageKind::Poster, c.image, c.art});
+                    }
+                }
+            }
+            app.images().want(req);
+        }
+
+        // ------------------------------------------------------------------ actions
+        void moveFocus(int d) {
+            int n = zoneSize(zone);
+            if (zone == NAV) {
+                navIndex = std::min(std::max(navIndex + d, 0), n - 1);
+            } else if (zone == HERO) {
+                heroIndex = std::min(std::max(heroIndex + d, 0), n - 1);
+            } else {
+                Rail &r = rails[(size_t) (zone - RAIL)];
+                r.index = std::min(std::max(r.index + d, 0), std::max(0, n - 1));
+            }
+        }
+
+        void activate() {
+            if (zone == NAV) {
+                openNav(navIds[(size_t) navIndex]);
+            } else if (zone == HERO) {
+                activateHero(heroIds[(size_t) heroIndex]);
+            } else {
+                Rail &r = rails[(size_t) (zone - RAIL)];
+                if (r.index >= (int) r.items.size()) {
+                    return;
+                }
+                const RailItem &it = r.items[(size_t) r.index];
+                switch (it.kind) {
+                    case ItemKind::History:
+                        if (r.kind == RailKind::Continue) {
+                            resume(it.history);
+                        } else {
+                            openRecent(it.history);
+                        }
+                        return;
+                    case ItemKind::Channel: {
+                        // zapping goes through the favorite channels, like in Favorites
+                        std::vector<int> list = app.session().live.favorites(app.library().favorites(iptv::ContentType::Live));
+                        int at = 0;
+                        for (size_t i = 0; i < list.size(); i++) {
+                            if (list[i] == it.index) {
+                                at = (int) i;
+                            }
+                        }
+                        app.push(screens::makeLivePlayer(app, list.empty() ? std::vector<int>{it.index} : list, at));
+                        return;
+                    }
+                    case ItemKind::Movie:
+                        app.push(screens::makeMovieDetail(app, app.vod().movies().items()[(size_t) it.index]));
+                        return;
+                    case ItemKind::Series:
+                        app.push(screens::makeSeriesDetail(app, app.vod().series().items()[(size_t) it.index]));
+                        return;
+                }
+            }
+        }
+
+        enum HeroAction {
+            HERO_RESUME,
+            HERO_DETAILS,
+            HERO_LIVE,
+            HERO_MOVIES,
+            HERO_SERIES,
+            HERO_SEARCH
+        };
+
+        void activateHero(int action) {
+            switch (action) {
+                case HERO_RESUME:
+                    if (hero) {
+                        resume(*hero);
+                    }
+                    return;
+                case HERO_DETAILS:
+                    if (hero) {
+                        openRecent(*hero);
+                    }
+                    return;
+                case HERO_LIVE:
+                    openNav(NAV_LIVE);
+                    return;
+                case HERO_MOVIES:
+                    openNav(NAV_MOVIES);
+                    return;
+                case HERO_SERIES:
+                    openNav(NAV_SERIES);
+                    return;
+                default:
+                    openNav(NAV_SEARCH);
+                    return;
+            }
+        }
+
+        void openNav(int item) {
+            switch (item) {
+                case NAV_HOME:
+                    zone = HERO;
+                    refresh();
+                    return;
+                case NAV_LIVE:
+                    app.push(screens::makeLive(app));
+                    return;
+                case NAV_MOVIES:
+                    app.push(screens::makeMovies(app));
+                    return;
+                case NAV_SERIES:
+                    app.push(screens::makeSeries(app));
+                    return;
+                case NAV_SEARCH:
+                    app.push(screens::makeSearch(app));
+                    return;
+                case NAV_FAVORITES:
+                    app.push(screens::makeFavorites(app));
+                    return;
+                case NAV_DOWNLOADS:
+                    app.push(screens::makeDownloads(app));
+                    return;
+                default:
+                    app.push(screens::makeSettings(app));
+                    return;
+            }
+        }
+
+        static screens::VodItem itemOf(const HistoryEntry &h) {
+            screens::VodItem it;
+            it.type = h.type;
+            it.id = h.id;
+            it.extension = h.extension.empty() ? "mkv" : h.extension;
+            it.title = h.name;
+            it.image = h.icon;
+            it.seriesId = h.seriesId;
+            it.seriesName = h.seriesName;
+            it.season = h.season;
+            it.episode = h.episode;
+            it.durationHint = h.duration;
+            return it;
+        }
+
+        // Continue Watching / the hero's Resume: play at once from the saved position. An episode gets the same
+        // context as one started in Series Detail (screens::playSeriesEpisode: the series' episodes, a downloaded
+        // copy from the disk, offline the downloaded episodes; the player completes it when the catalog arrives).
+        void resume(const HistoryEntry &h) {
+            screens::VodItem it = itemOf(h);
+            offline::preferLocal(app.downloads(), it, app.session().profile.id);   // a downloaded copy plays from the disk
+            if (h.type == iptv::ContentType::Series) {
+                app.push(screens::playSeriesEpisode(app, it, true));
+                return;
+            }
+            app.push(screens::makeVodPlayer(app, {it}, 0, true));
+        }
+
+        // hides the card at once (the next card moves into its place); progress, history and downloads stay
+        void removeFromContinueWatching(const HistoryEntry &h) {
+            if (!app.library().dismissFromContinueWatching(h.type, h.id)) {
+                return;
+            }
+            app.saveLibrary();
+            rebuildRows();
+            refresh();
+            requestImages();
+            app.toast(tr("home.cw_removed"));
+        }
+
+        // the card disappears at once; only the history entry goes (progress, favorites, downloads stay). The focus
+        // stays at the same place in the row: on the card that moved into it, or the new last one.
+        void removeFromRecentlyWatched(const HistoryEntry &h) {
+            if (!app.library().removeFromRecentlyWatched(h)) {
+                return;
+            }
+            app.saveLibrary();
+            rebuildRows();
+            refresh();
+            requestImages();
+            app.toast(tr("home.recent_removed"));
+        }
+
+        void openRecent(const HistoryEntry &h) {
+            switch (h.type) {
+                case iptv::ContentType::Live: {
+                    const auto &live = app.session().live;
+                    for (int i = 0; i < (int) live.channels().size(); i++) {
+                        if (live.channels()[(size_t) i].id == h.id) {
+                            app.push(screens::makeLivePlayer(app, {i}, 0));
+                            return;
+                        }
+                    }
+                    app.toast(tr("live.channel_gone"), ToastKind::Error);
+                    return;
+                }
+                case iptv::ContentType::Movie: {
+                    const iptv::Movie *m = app.vod().movies().find(h.id);
+                    if (m) {
+                        app.push(screens::makeMovieDetail(app, *m));
+                    } else {
+                        iptv::Movie fallback;   // catalog not loaded yet: what the history knows is enough
+                        fallback.streamId = h.id;
+                        fallback.name = fallback.title = h.name;
+                        fallback.icon = h.icon;
+                        fallback.extension = h.extension;
+                        app.push(screens::makeMovieDetail(app, fallback));
+                    }
+                    return;
+                }
+                default: {
+                    std::string sid = h.seriesId.empty() ? h.id : h.seriesId;
+                    const iptv::Series *s = app.vod().series().find(sid);
+                    if (s) {
+                        app.push(screens::makeSeriesDetail(app, *s));
+                    } else {
+                        iptv::Series fallback;
+                        fallback.seriesId = sid;
+                        fallback.name = fallback.title = h.seriesName.empty() ? h.name : h.seriesName;
+                        fallback.cover = h.icon;
+                        app.push(screens::makeSeriesDetail(app, fallback));
+                    }
+                    return;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ focus and layout
+        void refresh() {
+            navIndex = std::min(navIndex, (int) navIds.size() - 1);
+            heroIndex = std::min(heroIndex, std::max(0, heroCount - 1));
+            // navigation: the section the user is in (Início at the left) or the focused icon
+            for (int i = 0; i < (int) tabs.size(); i++) {
+                tabs[i]->setState(i == 0, zone == NAV && i == navIndex);
+            }
+            for (int i = 0; i < heroCount; i++) {
+                heroButtons[i]->setFocused(zone == HERO && i == heroIndex);
+            }
+            for (size_t ri = 0; ri < rails.size(); ri++) {
+                Rail &r = rails[ri];
+                bool active = zone == RAIL + (int) ri;
+                // whole cards: the focused one is always among the ones on screen
+                int before = r.first;
+                if (r.index < r.first) {
+                    r.first = r.index;
+                } else if (r.index >= r.first + L::CARDS_VISIBLE) {
+                    r.first = r.index - L::CARDS_VISIBLE + 1;
+                }
+                if (r.first != before) {
+                    imagesDue = true;   // other cards came on screen
+                }
+                r.layer->setPosition(theme::SAFE_X - (float) r.first * (L::CARD_W + L::CARD_GAP),
+                                     r.y + L::RAIL_HEADING_H);
+                if (r.more) {
+                    // more cards to the right: after every move, rebuild and removal (refresh runs after each)
+                    bool more = scroll::moreAfter(r.first, L::CARDS_VISIBLE, (int) r.items.size());
+                    r.more->setVisibility(more ? Visibility::Visible : Visibility::Hidden);
+                }
+                for (int i = 0; i < (int) r.cards.size(); i++) {
+                    Card &c = r.cards[(size_t) i];
+                    bool f = active && i == r.index;
+                    bool onScreen = i >= r.first && i < r.first + L::CARDS_VISIBLE;
+                    c.root->setVisibility(onScreen ? Visibility::Visible : Visibility::Hidden);
+                    focusCard(c, f);
+                }
+            }
+            layoutPage();
+            refreshHints();
+            if (imagesDue) {
+                imagesDue = false;
+                requestImages();
+            }
+        }
+
+        // focused: a raised neutral surface, the accent ring around the card, the artwork at full brightness and
+        // brighter text. Nothing is scaled: the poster stays at its texture's size (sharp).
+        static void focusCard(Card &c, bool f) {
+            c.root->setFillColor(f ? theme::focusNeutral() : theme::card());
+            c.ring->setOutlineColor(theme::accent());
+            c.ring->setVisibility(f ? Visibility::Visible : Visibility::Hidden);
+            if (c.poster) {
+                c.poster->setDimmed(!f);
+            }
+            c.focused = f;
+            c.title->setColor(f ? theme::textStrong() : theme::textPrimary());
+            c.meta->setColor(f ? theme::textPrimary() : theme::textSecondary());
+            c.detail->setColor(f ? theme::textSecondary() : theme::textMuted());
+        }
+
+        // the page scrolls so that the focused rail is completely above the hint bar
+        void layoutPage() {
+            float target = 0;
+            if (zone >= RAIL) {
+                const Rail &r = rails[(size_t) (zone - RAIL)];
+                target = std::max(0.0f, r.y + L::RAIL_HEADING_H + L::CARD_H - L::VIEW_BOTTOM);
+            }
+            scrollTarget = target;
+            if (!ui::smoothScrolling()) {
+                scrollPos = target;
+            }
+            page->setPosition(0, -std::round(scrollPos));
+            // once the page moves, the navigation sits on a solid band (rails slide under it)
+            bool scrolled = target > 0;
+            topSolid->setVisibility(scrolled ? Visibility::Visible : Visibility::Hidden);
+            topFade->setVisibility(scrolled ? Visibility::Visible : Visibility::Hidden);
+        }
+
+        void refreshHints() {
+            screens::Hints h;
+            bool cw = zone >= RAIL && rails[(size_t) (zone - RAIL)].kind == RailKind::Continue;
+            bool recent = zone >= RAIL && rails[(size_t) (zone - RAIL)].kind == RailKind::Recent
+                          && !rails[(size_t) (zone - RAIL)].items.empty();
+            bool resumeAction = cw || (zone == HERO && hero && heroIndex == 0);
+            h.push_back({A::Confirm, tr(resumeAction ? "common.resume" : "common.open")});
+            if (cw) {
+                h.push_back({A::Remove, tr("home.cw_remove")});
+            } else if (recent) {
+                h.push_back({A::Remove, tr("home.recent_remove")});
+            }
+            h.push_back({A::Search, tr("home.search")});
+            h.push_back({A::Back, tr("profiles.title")});
+            hints->setHints(h);
+        }
+
+        static const int HERO_BUTTONS = 3;
+
+        bool playlist = false;
+        RectangleShape *page = nullptr;
+        RectangleShape *topSolid = nullptr;
+        RectangleShape *topFade = nullptr;
+        std::vector<NavTab *> tabs;
+        std::vector<int> navIds;
+        ui::Backdrop *backdrop = nullptr;
+        ui::Label *eyebrow = nullptr;
+        ui::Label *heroTitle = nullptr;
+        ui::Label *heroSubtitle = nullptr;
+        ui::Label *heroMeta = nullptr;
+        ui::Label *heroTime = nullptr;
+        ui::ProgressBar *heroBar = nullptr;
+        ui::Button *heroButtons[HERO_BUTTONS] = {nullptr, nullptr, nullptr};
+        std::vector<int> heroIds;
+        int heroCount = 0;
+        HistoryEntry heroEntry;
+        const HistoryEntry *hero = nullptr;
+        std::string heroInfoRequested;   // "m<id>" / "s<id>" whose detail info the Home asked for
+        bool heroBackdropWanted = false; // the last request asked for the backdrop (else the hero poster)
+        const void *heroArtLogged = nullptr;
+        std::string heroArtKey;           // what the last hero art log line described
+        RectangleShape *showcase = nullptr;        // the showcase poster: shadow, image, frame
+        RectangleShape *showcaseShadow = nullptr;
+        RectangleShape *showcaseImage = nullptr;
+        RectangleShape *showcaseFrame = nullptr;
+        std::shared_ptr<c2d::Texture> showcaseTexture;
+        images::hero::Showcase showcaseShown;
+        std::vector<Rail> rails;
+        size_t favoritesTotal = 0;
+        bool imagesDue = false;
+        ui::HintBar *hints = nullptr;
+        std::string clockText;
+        int zone = HERO;
+        int navIndex = 0;
+        int heroIndex = 0;
+        float scrollPos = 0;
+        float scrollTarget = 0;
+        double lastTick = -1;
+        unsigned liveGen = 0;
+        unsigned vodGen = 0;
+        unsigned imageGen = 0;
+        unsigned libraryGen = 0;
+
+        c2d::C2DTexture *logoTex = nullptr;
+        ui::Label *clockLabel = nullptr;
+
+        ~HomeScreen() override {
+            if (logoTex) { delete logoTex; logoTex = nullptr; }
+        }
+    };
+
+    // tiny placeholder screen kept for section stubs used while features bake
+    class SectionScreen : public Screen {
+    public:
+        SectionScreen(App &a, const std::string &t, const std::string &m) : Screen(a) {
+            ui::background(this);
+            ui::Label *title = screens::header(this, t);
+            (void) title;
+            auto *msg = ui::label(this, m, theme::BODY, theme::SAFE_X, layout::CONTENT_TOP + 40, ui::Weight::Regular,
+                                  theme::textSecondary());
+            msg->setMaxWidth(layout::CONTENT_W);
+            msg->setMaxLines(8);
+            screens::hintBar(this, {{A::Back, tr("common.back")}});
+        }
+        const char *name() const override { return "section"; }
+        void handleInput(const InputEvent &e) override {
+            if (e.button == PadButton::Circle && !e.repeat) app.pop();
+        }
+    };
+}
+
+namespace screens {
+    Screen *makeHome(App &app) { return new HomeScreen(app); }
+    Screen *makeSection(App &app, const std::string &title, const std::string &message) {
+        return new SectionScreen(app, title, message);
+    }
+}

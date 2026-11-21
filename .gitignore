@@ -1,0 +1,70 @@
+# Reference clones of upstream projects (pPlay, PacBrew recipes) - fetched, not vendored
+/external/
+
+# Project-local toolchain (LLVM, CMake, Ninja, PacBrew sysroot, OpenOrbis tools, host libcurl)
+/toolchain/
+
+# Build output (PKGs, ELFs, test binaries, test servers' scratch data, logs of builds)
+/build/
+/build-*/
+*.pkg
+*.oelf
+eboot.bin
+
+# Local configuration - may contain IPTV credentials / authenticated URLs. NEVER commit.
+/config/test_stream.txt
+/config/test_streams.txt
+/config/forbidden_strings.txt
+test_streams.txt
+!/config/test_streams.example.txt
+/config/*.local.*
+*.local.json
+.env
+
+# M3U / M3U8 playlists carry stream URLs with credentials or tokens. NEVER commit a real one; only the
+# sanitized parser fixtures (example hosts) are tracked.
+*.m3u
+*.m3u8
+!/tests/fixtures/m3u/*.m3u
+!/tests/fixtures/m3u/*.m3u8
+/playlists/
+m3u_playlist.json
+m3u_playlist.meta
+profiles.v1.json
+
+# Data the app writes on the console (never part of the source): profiles with logins, settings, library,
+# downloads and their manifest, caches
+profiles.json
+settings.json
+favorites.json
+history.json
+downloads.json
+/downloads/
+*.part
+*.largefile-probe
+
+# Unedited console screenshots: may show server addresses or account details. Only the sanitized copies in
+# docs/screenshots/ are published.
+/docs/screenshots/raw/
+
+# Local logs and download test artifacts
+*.log
+log.txt
+log.prev.txt
+download-test-server.port
+
+# Python / tool caches
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
+
+# guard/verification scratch folders (may briefly contain extracted PKG data)
+/build/guard-test-*/
+/build/verify-extract-*/
