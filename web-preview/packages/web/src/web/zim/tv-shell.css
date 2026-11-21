@@ -1,0 +1,179 @@
+/* Tokens, base e componentes compartilhados do ZIMTV. */
+:root {
+  --zim-bg: #100921;
+  --zim-bg-2: #180d30;
+  --zim-violet: #7942ec;
+  --zim-lime: #c1f873;
+  --zim-pink: #f577d2;
+  --zim-text: #ffffff;
+  --zim-lilac: #d8c8f5;
+  --zim-muted: #a996cf;
+  --zim-line: rgba(197, 165, 255, 0.28);
+  --zim-glass: rgba(43, 22, 84, 0.55);
+  --zim-radius: 18px;
+  --zim-safe-x: 5vw;
+  --zim-safe-y: 5vh;
+  --zim-ui-scale: 1;
+  font-family: "Poppins", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.zim-root {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 90% at 70% 0%, rgba(121, 66, 236, 0.35), transparent 60%),
+    radial-gradient(90% 80% at 0% 100%, rgba(245, 119, 210, 0.12), transparent 60%),
+    var(--zim-bg);
+  color: var(--zim-text);
+  display: flex;
+  flex-direction: column;
+}
+
+.zim-root.tv-mode {
+  font-size: calc(16px * var(--zim-ui-scale));
+}
+
+.zim-root.tv-mode {
+  --zim-ui-scale: 1.15;
+}
+
+@media (min-width: 1600px) {
+  .zim-root.tv-mode {
+    font-size: 19px;
+  }
+}
+
+.zim-stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: var(--zim-safe-y) var(--zim-safe-x) 0;
+  scroll-behavior: smooth;
+}
+
+.reduce-motion,
+.reduce-motion * {
+  animation-duration: 0.001ms !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .zim-root *,
+  .zim-root *::before,
+  .zim-root *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Foco: sempre visível, inclusive sem mouse */
+.zf {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+  scroll-margin: 12vh 6vw 14vh;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+
+.zf:focus {
+  outline: none;
+}
+
+.zf:focus-visible,
+.zf:focus {
+  box-shadow: 0 0 0 3px var(--zim-lime), 0 0 26px rgba(193, 248, 115, 0.45);
+}
+
+.zf:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Rodapé de controles */
+.tv-footer {
+  flex: 0 0 auto;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px var(--zim-safe-x);
+  background: linear-gradient(180deg, rgba(16, 9, 33, 0), rgba(16, 9, 33, 0.95) 40%);
+  border-top: 1px solid var(--zim-line);
+  font-size: 0.82rem;
+  color: var(--zim-lilac);
+  flex-wrap: wrap;
+}
+
+.tv-symbols {
+  display: flex;
+  gap: 18px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.tv-symbols span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sym {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-style: normal;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #fff;
+  background: rgba(121, 66, 236, 0.5);
+}
+
+.sym-x { background: #2f6bff; }
+.sym-o { background: #e0373f; }
+.sym-tri { background: #1fb88a; }
+.sym-sq { background: #c04fd1; }
+.sym-dpad { background: rgba(255, 255, 255, 0.18); }
+
+.tv-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.tv-pad-status {
+  color: var(--zim-muted);
+  font-size: 0.78rem;
+}
+
+.tv-btn {
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--zim-glass);
+  border: 1px solid var(--zim-line);
+  color: var(--zim-text);
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+.tv-fs-msg {
+  width: 100%;
+  margin: 0;
+  color: var(--zim-pink);
+  font-size: 0.8rem;
+}
+
+.zim-root.web-mode .tv-footer {
+  font-size: 0.75rem;
+}
