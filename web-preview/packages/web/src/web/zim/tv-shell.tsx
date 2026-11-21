@@ -262,7 +262,7 @@ export function TvShell({ children, tvMode, reduceMotion, onToggleTv, onAction, 
               Tela cheia
             </button>
           </div>
-          {fsMessage && <p className="tv-fs-msg" role="status">{fsMessage}</p>}
+          {fsMessage && <output className="tv-fs-msg">{fsMessage}</output>}
         </footer>
       </div>
     </TvContext.Provider>

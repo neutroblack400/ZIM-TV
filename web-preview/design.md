@@ -1,47 +1,33 @@
-# <App Name> — Design
+# ZIMTV · Design (prévia web)
 
-> Starter design brief. Replace this content with the app you're building before writing any UI.
-> Keep it short and concrete — it's the single source of truth for palette, typography, pages,
-> screens, and flows across web, mobile, and desktop.
+## Identidade
+- Marca: "ZIM" em lime `#c1f873` e "TV" em rosa `#f577d2`. Logo em `public/images/zimtv-logo.png`.
+- Slogan: "Sua TV, do seu jeito."
+- Visual cinematográfico: fundo `#100921`, violeta `#7942ec`, texto lilás, cantos arredondados, bordas lilás finas.
+- Sem visual de painel administrativo. Sem logos, pôsteres ou artes reais: só gradientes e imagens geradas.
 
-One-line description of the app, the platforms it ships on, the visual direction (style, feel), and the core job it does for the user.
+## Tokens (`packages/web/src/web/zim/zim.css`)
+| Token | Valor |
+|---|---|
+| `--zim-bg` | `#100921` |
+| `--zim-violet` | `#7942ec` |
+| `--zim-lime` | `#c1f873` |
+| `--zim-pink` | `#f577d2` |
+| `--zim-lilac` | lilás do texto secundário |
+| `--zim-line` | borda lilás fina |
+| `--zim-muted` | texto de apoio |
 
-## Brand & Colors
+## Escala e TV
+- Modo TV ligado por padrão. Escala base `--zim-ui-scale: 1.15` (16px × 1.15), 19px em telas ≥1600px.
+- Margem de segurança de ~5%.
+- Rodapé com símbolos de controle (✥ ✕ ○ △ □ L1/R1).
+- Responsivo abaixo de 900px, sem rolagem horizontal.
 
-One token set, consumed per platform:
+## Foco
+- Elementos navegáveis recebem `.zf`. O foco inicial vem de `data-autofocus="true"`.
+- Modais e player marcam `data-modal-open`; o foco fica restrito ao modal mais alto.
+- Anel luminoso no card focado.
 
-- **Web & desktop**: CSS variables in `packages/web/src/web/styles.css` (desktop loads the web UI).
-- **Mobile**: `Colors.light` / `Colors.dark` in `packages/mobile/constants/theme.ts`, read via `useColors()`; `userInterfaceStyle: "automatic"` follows the system light/dark setting.
-
-| Token | Light | Dark | Use |
-|-------|-------|------|-----|
-| primary | #1F1F1F | #E5E5E5 | Buttons, active tab, accents |
-| background | #FFFFFF | #0A0A0A | Page/screen background |
-| card | #FFFFFF | #1A1A1A | Cards, surfaces |
-| foreground | #171717 | #FAFAFA | Primary text |
-| mutedForeground | #737373 | #A3A3A3 | Secondary text |
-| border | #E5E5E5 | #262626 | Hairlines |
-| destructive | #DC2626 | #EF4444 | Delete / errors |
-
-## Typography
-
-Name the display + body pairing here. Web: set font families in `styles.css` (self-hosted files go in `packages/web/public/fonts/`). Mobile: system font by default; load custom fonts with `useFonts` from `expo-font` and reference them via `Fonts` in `constants/theme.ts`.
-
-## Pages & Screens
-
-List each page/screen, its route file, and what it shows. Example:
-
-- **Web — Home** (`packages/web/src/web/pages/index.tsx`) — what the user sees first.
-- **Mobile — Home** (`packages/mobile/app/(tabs)/index.tsx`) — main tab.
-- Add web pages under `src/web/pages/` (+ route in `app.tsx`); mobile tabs under `app/(tabs)/`, stack/modal screens under `app/`.
-
-## Key User Flows
-
-1. Describe the primary flow end to end (open → action → result).
-2. ...
-
-## Architecture
-
-- **API**: typed oRPC client (`lib/api.ts` in each package) → the backend in `@template/web`. Query/mutation hooks live in `queries/` (one file per feature); pages/screens call them with `@tanstack/react-query`.
-- **State/sync**: TanStack Query with optimistic updates for instant-feel interactions.
-- **Auth / payments / uploads**: see `skills/app/references/` when those features are needed.
+## Movimento
+- Animações curtas (rise de modal, progresso de carregamento).
+- `prefers-reduced-motion` e o interruptor em Configurações desligam animações.
