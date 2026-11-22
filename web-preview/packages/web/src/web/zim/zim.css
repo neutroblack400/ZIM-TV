@@ -142,8 +142,8 @@
 /* Herói */
 .hero {
   position: relative;
-  min-height: 62vh;
-  border-radius: 26px;
+  min-height: 72vh;
+  border-radius: 28px;
   overflow: hidden;
   border: 1px solid var(--zim-line);
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45);
@@ -166,7 +166,7 @@
   inset: 0;
   background:
     linear-gradient(90deg, rgba(16, 9, 33, 0.96) 0%, rgba(16, 9, 33, 0.7) 45%, rgba(16, 9, 33, 0.1) 100%),
-    linear-gradient(0deg, rgba(16, 9, 33, 1) 0%, rgba(16, 9, 33, 0) 45%);
+    linear-gradient(0deg, rgba(16, 9, 33, 1) 0%, rgba(16, 9, 33, 0.85) 22%, rgba(16, 9, 33, 0) 55%);
 }
 
 .hero-body {
@@ -176,9 +176,10 @@
 }
 
 .hero-title {
-  font-size: 2.8em;
-  line-height: 1.05;
+  font-size: 3.4em;
+  line-height: 1.02;
   font-weight: 800;
+  letter-spacing: -0.02em;
   margin: 0.2em 0 0.3em;
 }
 
@@ -248,6 +249,14 @@
 /* Prateleiras */
 .shelf {
   margin-bottom: 40px;
+}
+
+.shelf h3 {
+  font-size: 1.45em;
+  font-weight: 700;
+  margin: 0 0 2px 6px;
+  color: #fff;
+  letter-spacing: -0.01em;
 }
 
 .shelf-row {
@@ -330,8 +339,9 @@
 }
 
 .tcard:focus {
-  transform: scale(1.04);
-  border-color: var(--zim-lime);
+  transform: scale(1.06);
+  border-color: #fff;
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.9), 0 24px 50px rgba(0, 0, 0, 0.55);
 }
 
 .tcard-progress {
