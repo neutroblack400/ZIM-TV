@@ -85,11 +85,44 @@ interface HomeProps {
   onGoLive: () => void;
 }
 
+const HERO_TITLES = TITLES.slice(0, 6);
+
+interface ShelfProps {
+  label: string;
+  items: ZTitle[];
+  onOpen: (id: string) => void;
+  ranked?: boolean;
+}
+
+function Shelf({ label, items, onOpen, ranked }: ShelfProps) {
+  return (
+    <section className="shelf" aria-label={label}>
+      <h3>{label}</h3>
+      <div className="shelf-row">
+        {items.map((t, i) =>
+          ranked ? (
+            <div key={t.id} className="top-item">
+              <span className="top-num" aria-hidden="true">{i + 1}</span>
+              <TitleCard title={t} onOpen={onOpen} />
+            </div>
+          ) : (
+            <TitleCard key={t.id} title={t} onOpen={onOpen} />
+          ),
+        )}
+      </div>
+    </section>
+  );
+}
+
 export function HomeView({ onOpenDetails, onPlay, onGoLive }: HomeProps) {
   const [idx, setIdx] = useState(0);
-  const hero = TITLES[idx];
-  const shift = (d: number) => setIdx((i) => (i + d + TITLES.length) % TITLES.length);
+  const hero = HERO_TITLES[idx];
+  const shift = (d: number) => setIdx((i) => (i + d + HERO_TITLES.length) % HERO_TITLES.length);
   const continuing = TITLES.filter((t) => t.progress > 0);
+  const recent = [...TITLES].sort((a, b) => b.year - a.year);
+  const movies = TITLES.filter((t) => t.kind === "movie");
+  const series = TITLES.filter((t) => t.kind === "series");
+  const genreRows = GENRES.map((g) => ({ genre: g, items: TITLES.filter((t) => t.genre === g) })).filter((r) => r.items.length >= 2);
 
   return (
     <div className="home">
@@ -120,7 +153,7 @@ export function HomeView({ onOpenDetails, onPlay, onGoLive }: HomeProps) {
             ›
           </button>
           <div className="hero-dots">
-            {TITLES.map((t, i) => (
+            {HERO_TITLES.map((t, i) => (
               <button
                 key={t.id}
                 type="button"
@@ -139,25 +172,15 @@ export function HomeView({ onOpenDetails, onPlay, onGoLive }: HomeProps) {
         <span>Canais de exemplo com grade ilustrativa. Veja a seção Ao vivo.</span>
       </button>
 
-      {continuing.length > 0 && (
-        <section className="shelf" aria-label="Continue assistindo">
-          <h3>Continue assistindo</h3>
-          <div className="shelf-row">
-            {continuing.map((t) => (
-              <TitleCard key={t.id} title={t} onOpen={onOpenDetails} />
-            ))}
-          </div>
-        </section>
-      )}
-
-      <section className="shelf" aria-label="Sua próxima grande história">
-        <h3>Sua próxima grande história</h3>
-        <div className="shelf-row">
-          {TITLES.map((t) => (
-            <TitleCard key={t.id} title={t} onOpen={onOpenDetails} />
-          ))}
-        </div>
-      </section>
+      {continuing.length > 0 && <Shelf label="Continue assistindo" items={continuing} onOpen={onOpenDetails} />}
+      <Shelf label="Top 10 de hoje" items={TITLES.slice(0, 10)} onOpen={onOpenDetails} ranked />
+      <Shelf label="Adicionados recentemente" items={recent} onOpen={onOpenDetails} />
+      <Shelf label="Filmes em destaque" items={movies} onOpen={onOpenDetails} />
+      <Shelf label="Séries populares" items={series} onOpen={onOpenDetails} />
+      {genreRows.map((r) => (
+        <Shelf key={r.genre} label={r.genre} items={r.items} onOpen={onOpenDetails} />
+      ))}
+      <Shelf label="Para você" items={TITLES} onOpen={onOpenDetails} />
     </div>
   );
 }
